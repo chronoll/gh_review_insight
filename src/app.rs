@@ -1,5 +1,9 @@
-//! The egui/eframe GUI. Shows the `status` view as a table of pull requests;
-//! clicking a PR (its id or title) opens the GitHub page in the browser.
+//! The egui/eframe GUI.
+//!
+//! Two views, toggled in the toolbar:
+//! - **status**: a table of pull requests. Clicking a PR (its id or title)
+//!   opens the GitHub page in the browser.
+//! - **stats**: aggregated review activity for the last N days.
 //!
 //! Fetching runs on a background thread and the result is delivered over a
 //! channel, so the gh subprocess never blocks the UI thread.
@@ -9,21 +13,36 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::core::{StatusOptions, collect_status};
+use crate::core::{StatsOptions, StatusOptions, collect_stats, collect_status};
 use crate::gh::GhClient;
-use crate::model::{PullRequestSummary, short_state};
+use crate::model::{PullRequestSummary, Stats, short_state};
 
-type FetchResult = Result<(String, Vec<PullRequestSummary>), String>;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Status,
+    Stats,
+}
+
+enum Loaded {
+    Status(Vec<PullRequestSummary>),
+    Stats(Stats),
+}
+
+type FetchResult = Result<(String, Loaded), String>;
 
 enum ViewState {
     Loading,
-    Ready(Vec<PullRequestSummary>),
+    Ready(Loaded),
     Error(String),
 }
 
 pub struct App {
     gh_path: String,
-    opts: StatusOptions,
+    user: String,
+    repos: Vec<String>,
+    owners: Vec<String>,
+    days: i64,
+    mode: Mode,
     login: String,
     state: ViewState,
     rx: Option<Receiver<FetchResult>>,
@@ -32,10 +51,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(opts: StatusOptions, gh_path: String) -> Self {
+    pub fn new(gh_path: String) -> Self {
         Self {
             gh_path,
-            opts,
+            user: "@me".to_string(),
+            repos: Vec::new(),
+            owners: Vec::new(),
+            days: 30,
+            mode: Mode::Status,
             login: String::new(),
             state: ViewState::Loading,
             rx: None,
@@ -50,13 +73,43 @@ impl App {
         self.rx = Some(rx);
 
         let gh_path = self.gh_path.clone();
-        let opts = self.opts.clone();
+        let mode = self.mode;
+        let user = self.user.clone();
+        let repos = self.repos.clone();
+        let owners = self.owners.clone();
+        let days = self.days;
         let ctx = ctx.clone();
+
         std::thread::spawn(move || {
             let client = GhClient::new(gh_path);
-            let result = collect_status(&client, &opts).map_err(|err| format!("{err:#}"));
+            let result = match mode {
+                Mode::Status => collect_status(
+                    &client,
+                    &StatusOptions {
+                        user,
+                        repos,
+                        owners,
+                        include_drafts: false,
+                        no_reviewed: false,
+                        limit: 50,
+                    },
+                )
+                .map(|(login, prs)| (login, Loaded::Status(prs))),
+                Mode::Stats => collect_stats(
+                    &client,
+                    &StatsOptions {
+                        user,
+                        repos,
+                        owners,
+                        days,
+                        limit: 200,
+                    },
+                )
+                .map(|(login, stats)| (login, Loaded::Stats(stats))),
+            }
+            .map_err(|err| format!("{err:#}"));
+
             let _ = tx.send(result);
-            // Wake the UI so it picks up the result on the next frame.
             ctx.request_repaint();
         });
     }
@@ -65,15 +118,65 @@ impl App {
         if let Some(rx) = &self.rx {
             if let Ok(result) = rx.try_recv() {
                 match result {
-                    Ok((login, prs)) => {
+                    Ok((login, loaded)) => {
                         self.login = login;
-                        self.state = ViewState::Ready(prs);
+                        self.state = ViewState::Ready(loaded);
                     }
                     Err(message) => self.state = ViewState::Error(message),
                 }
                 self.rx = None;
             }
         }
+    }
+
+    fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.heading("gh-review-insight");
+            ui.separator();
+            if ui.selectable_value(&mut self.mode, Mode::Status, "status").clicked() {
+                self.start_fetch(ctx);
+            }
+            if ui.selectable_value(&mut self.mode, Mode::Stats, "stats").clicked() {
+                self.start_fetch(ctx);
+            }
+            if ui.button("⟳ 更新").clicked() {
+                self.start_fetch(ctx);
+            }
+            ui.separator();
+
+            match self.mode {
+                Mode::Status => {
+                    ui.label("フィルタ:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .hint_text("title / repo / author")
+                            .desired_width(220.0),
+                    );
+                }
+                Mode::Stats => {
+                    ui.label("days:");
+                    ui.add(egui::DragValue::new(&mut self.days).range(1..=365));
+                    ui.label("（変更後に「更新」）");
+                }
+            }
+
+            ui.separator();
+            match &self.state {
+                ViewState::Loading => {
+                    ui.spinner();
+                    ui.label("読み込み中…");
+                }
+                ViewState::Error(_) => {
+                    ui.colored_label(egui::Color32::RED, "取得エラー");
+                }
+                ViewState::Ready(Loaded::Status(prs)) => {
+                    ui.label(format!("{} 件 / {}", prs.len(), self.login));
+                }
+                ViewState::Ready(Loaded::Stats(_)) => {
+                    ui.label(format!("/ {}", self.login));
+                }
+            }
+        });
     }
 
     fn table(&self, ui: &mut egui::Ui, prs: &[PullRequestSummary]) {
@@ -139,7 +242,7 @@ impl App {
                             });
                         });
                         row.col(|ui| {
-                            ui.label(pr.updated_at.chars().take(10).collect::<String>());
+                            ui.label(date10(&pr.updated_at));
                         });
                         row.col(|ui| {
                             ui.hyperlink_to(pr.title.as_str(), pr.url.as_str())
@@ -147,6 +250,49 @@ impl App {
                         });
                     });
                 }
+            });
+    }
+
+    fn stats_view(&self, ui: &mut egui::Ui, stats: &Stats) {
+        egui::Grid::new("stats_grid")
+            .num_columns(2)
+            .spacing([24.0, 8.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("期間");
+                ui.label(format!("{} 〜 {}", date10(&stats.since), date10(&stats.until)));
+                ui.end_row();
+
+                ui.strong("レビュー提出数");
+                ui.label(stats.own_review_submissions.to_string());
+                ui.end_row();
+
+                ui.strong("レビューしたPR数");
+                ui.label(stats.unique_prs_reviewed.to_string());
+                ui.end_row();
+
+                ui.strong("対象PR上の全レビュー数");
+                ui.label(stats.reviews_on_touched_prs.to_string());
+                ui.end_row();
+
+                ui.strong("自分の割合");
+                ui.label(format!("{:.1}%", stats.own_share * 100.0));
+                ui.end_row();
+
+                ui.strong("他レビュワーもいたPR数");
+                ui.label(stats.prs_with_other_reviewers.to_string());
+                ui.end_row();
+
+                ui.strong("状態内訳");
+                ui.label(format!(
+                    "approved {} / changes {} / comment {} / dismissed {}",
+                    stats.approved, stats.changes_requested, stats.commented, stats.dismissed,
+                ));
+                ui.end_row();
+
+                ui.strong("候補PR数");
+                ui.label(stats.candidate_prs.to_string());
+                ui.end_row();
             });
     }
 }
@@ -160,45 +306,25 @@ impl eframe::App for App {
         self.poll();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("gh-review-insight");
-                if ui.button("⟳ 更新").clicked() {
-                    self.start_fetch(ctx);
-                }
-                ui.separator();
-                ui.label("フィルタ:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text("title / repo / author")
-                        .desired_width(220.0),
-                );
-                ui.separator();
-                match &self.state {
-                    ViewState::Loading => {
-                        ui.spinner();
-                        ui.label("読み込み中…");
-                    }
-                    ViewState::Error(_) => {
-                        ui.colored_label(egui::Color32::RED, "取得エラー");
-                    }
-                    ViewState::Ready(prs) => {
-                        ui.label(format!("{} 件 / {}", prs.len(), self.login));
-                    }
-                }
-            });
+            self.toolbar(ui, ctx);
         });
 
         egui::CentralPanel::default().show(ctx, |ui| match &self.state {
             ViewState::Loading => {
-                ui.label("PR を取得しています…");
+                ui.label("取得しています…");
             }
             ViewState::Error(message) => {
                 ui.colored_label(egui::Color32::RED, message);
                 ui.label("`gh` が認証済みか（`gh auth status`）確認してください。");
             }
-            ViewState::Ready(prs) => self.table(ui, prs),
+            ViewState::Ready(Loaded::Status(prs)) => self.table(ui, prs),
+            ViewState::Ready(Loaded::Stats(stats)) => self.stats_view(ui, stats),
         });
     }
+}
+
+fn date10(value: &str) -> String {
+    value.chars().take(10).collect()
 }
 
 fn others_text(pr: &PullRequestSummary) -> String {
@@ -216,15 +342,19 @@ fn detail_text(pr: &PullRequestSummary) -> String {
     let mut lines = vec![
         format!("{}  ({})", pr.pr_key(), pr.state),
         pr.title.clone(),
-        format!("author: {}{}", pr.author, if pr.is_draft { "  (draft)" } else { "" }),
+        format!(
+            "author: {}{}",
+            pr.author,
+            if pr.is_draft { "  (draft)" } else { "" }
+        ),
     ];
     if let Some(decision) = &pr.review_decision {
         lines.push(format!("decision: {decision}"));
     }
     lines.push(format!(
         "created: {}   updated: {}",
-        pr.created_at.chars().take(10).collect::<String>(),
-        pr.updated_at.chars().take(10).collect::<String>(),
+        date10(&pr.created_at),
+        date10(&pr.updated_at),
     ));
     if !pr.sources.is_empty() {
         lines.push(format!("via: {}", pr.sources.join(", ")));
@@ -237,7 +367,7 @@ fn detail_text(pr: &PullRequestSummary) -> String {
         for review in timeline {
             lines.push(format!(
                 "  {}  {:<16} {}",
-                review.submitted_at.chars().take(10).collect::<String>(),
+                date10(&review.submitted_at),
                 review.author,
                 short_state(&review.state),
             ));

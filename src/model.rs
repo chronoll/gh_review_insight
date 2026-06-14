@@ -47,6 +47,24 @@ impl PullRequestSummary {
     }
 }
 
+/// Aggregated review activity for a period.
+#[derive(Clone, Debug, Default)]
+pub struct Stats {
+    pub own_review_submissions: usize,
+    pub unique_prs_reviewed: usize,
+    pub reviews_on_touched_prs: usize,
+    pub own_share: f64,
+    pub prs_with_other_reviewers: usize,
+    pub approved: usize,
+    pub changes_requested: usize,
+    pub commented: usize,
+    pub dismissed: usize,
+    pub candidate_prs: usize,
+    /// RFC3339 window bounds (UTC).
+    pub since: String,
+    pub until: String,
+}
+
 /// Short, lower-case label for a GitHub review state.
 pub fn short_state(state: &str) -> String {
     match state {

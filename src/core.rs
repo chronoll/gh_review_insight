@@ -1,12 +1,13 @@
 //! Fetching and aggregation. Builds GitHub search queries, runs them through
 //! `gh`, and turns the raw JSON nodes into `PullRequestSummary` values.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::gh::{GhClient, GqlVar};
-use crate::model::{PullRequestSummary, ReviewSummary};
+use crate::model::{PullRequestSummary, ReviewSummary, Stats};
 
 const PR_SEARCH_QUERY: &str = r#"
 query($searchQuery: String!, $first: Int!, $after: String) {
@@ -326,6 +327,153 @@ fn latest_reviews_by_author(reviews: &[ReviewSummary]) -> BTreeMap<String, Revie
     latest
 }
 
+/// Options for the `stats` query.
+#[derive(Clone, Debug)]
+pub struct StatsOptions {
+    pub user: String,
+    pub repos: Vec<String>,
+    pub owners: Vec<String>,
+    pub days: i64,
+    pub limit: usize,
+}
+
+impl Default for StatsOptions {
+    fn default() -> Self {
+        Self {
+            user: "@me".to_string(),
+            repos: Vec::new(),
+            owners: Vec::new(),
+            days: 30,
+            limit: 200,
+        }
+    }
+}
+
+/// Summarize the viewer's review activity over the last `opts.days` days.
+pub fn collect_stats(client: &GhClient, opts: &StatsOptions) -> Result<(String, Stats)> {
+    let (login, _search_user) = normalize_login(&opts.user, client)?;
+    let until = Utc::now();
+    let since = until - Duration::days(opts.days.max(0));
+
+    let mut parts = vec![
+        "is:pr".to_string(),
+        "archived:false".to_string(),
+        format!("reviewed-by:{login}"),
+        format!("updated:>={}", since.format("%Y-%m-%d")),
+    ];
+    parts.extend(scope_qualifiers(&opts.repos, &opts.owners));
+
+    let nodes = search_pull_requests(client, &parts.join(" "), opts.limit)?;
+    let summaries: Vec<PullRequestSummary> = nodes
+        .iter()
+        .map(|node| summarize_pull_request(node, &login, &["reviewed".to_string()]))
+        .collect();
+
+    let mut stats = calculate_stats(&login, &summaries, since, until);
+    stats.candidate_prs = summaries.len();
+    Ok((login, stats))
+}
+
+/// Parse a GitHub ISO-8601 timestamp (e.g. `2026-06-03T00:00:00Z`) as UTC.
+pub fn parse_datetime(value: &str) -> Result<DateTime<Utc>> {
+    let parsed = DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("日時を解析できません: {value}"))?;
+    Ok(parsed.with_timezone(&Utc))
+}
+
+/// Parse `YYYY-MM-DD` (or a full ISO timestamp) as UTC. With `end_of_day`, a
+/// date-only value is pushed to the last microsecond of that day.
+///
+/// Kept for parity with the original tool's explicit `--since/--until` window
+/// (the GUI currently exposes only a day count); covered by unit tests.
+#[allow(dead_code)]
+pub fn parse_date(value: &str, end_of_day: bool) -> Result<DateTime<Utc>> {
+    if value.len() == 10 {
+        let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .with_context(|| format!("日付を解析できません: {value}"))?;
+        let start = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap());
+        if end_of_day {
+            return Ok(start + Duration::days(1) - Duration::microseconds(1));
+        }
+        return Ok(start);
+    }
+    parse_datetime(value)
+}
+
+/// Aggregate review statistics over `[since, until]`.
+pub fn calculate_stats(
+    login: &str,
+    summaries: &[PullRequestSummary],
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> Stats {
+    let in_window = |value: &str| match parse_datetime(value) {
+        Ok(dt) => since <= dt && dt <= until,
+        Err(_) => false,
+    };
+
+    let mut own_reviews = 0usize;
+    let mut all_reviews = 0usize;
+    let mut unique: BTreeSet<String> = BTreeSet::new();
+    let mut with_others: BTreeSet<String> = BTreeSet::new();
+    let (mut approved, mut changes, mut commented, mut dismissed) = (0usize, 0usize, 0usize, 0usize);
+
+    for summary in summaries {
+        let key = summary.pr_key();
+        let own_in_window: Vec<&ReviewSummary> = summary
+            .reviews
+            .iter()
+            .filter(|r| r.author == login && in_window(&r.submitted_at))
+            .collect();
+        if own_in_window.is_empty() {
+            continue;
+        }
+
+        unique.insert(key.clone());
+        own_reviews += own_in_window.len();
+        for review in &own_in_window {
+            match review.state.as_str() {
+                "APPROVED" => approved += 1,
+                "CHANGES_REQUESTED" => changes += 1,
+                "COMMENTED" => commented += 1,
+                "DISMISSED" => dismissed += 1,
+                _ => {}
+            }
+        }
+
+        let reviews_in_window: Vec<&ReviewSummary> = summary
+            .reviews
+            .iter()
+            .filter(|r| in_window(&r.submitted_at))
+            .collect();
+        all_reviews += reviews_in_window.len();
+        if reviews_in_window.iter().any(|r| r.author != login) {
+            with_others.insert(key);
+        }
+    }
+
+    let share = if all_reviews > 0 {
+        own_reviews as f64 / all_reviews as f64
+    } else {
+        0.0
+    };
+
+    Stats {
+        own_review_submissions: own_reviews,
+        unique_prs_reviewed: unique.len(),
+        reviews_on_touched_prs: all_reviews,
+        own_share: (share * 10000.0).round() / 10000.0,
+        prs_with_other_reviewers: with_others.len(),
+        approved,
+        changes_requested: changes,
+        commented,
+        dismissed,
+        candidate_prs: 0,
+        since: since.to_rfc3339(),
+        until: until.to_rfc3339(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +543,34 @@ mod tests {
         assert_eq!(summary.self_status(), "seen");
         assert!(summary.my_latest_review.is_none());
         assert_eq!(summary.other_latest_reviews.len(), 2);
+    }
+
+    #[test]
+    fn calculate_stats_counts_reviews_in_window() {
+        let summary = summarize_pull_request(&fixture_pr(), "bob", &["reviewed".to_string()]);
+        let since = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let until = Utc.with_ymd_and_hms(2026, 6, 30, 0, 0, 0).unwrap();
+
+        let stats = calculate_stats("bob", &[summary], since, until);
+
+        assert_eq!(stats.own_review_submissions, 2);
+        assert_eq!(stats.unique_prs_reviewed, 1);
+        assert_eq!(stats.reviews_on_touched_prs, 3);
+        assert!((stats.own_share - 0.6667).abs() < 1e-9);
+        assert_eq!(stats.prs_with_other_reviewers, 1);
+        assert_eq!(stats.approved, 1);
+        assert_eq!(stats.commented, 1);
+    }
+
+    #[test]
+    fn parse_datetime_accepts_github_zulu_time() {
+        let parsed = parse_datetime("2026-06-03T00:00:00Z").unwrap();
+        assert_eq!(parsed, Utc.with_ymd_and_hms(2026, 6, 3, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_date_can_include_full_until_day() {
+        let parsed = parse_date("2026-06-14", true).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-06-14T23:59:59.999999+00:00");
     }
 }
