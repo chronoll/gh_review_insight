@@ -7,7 +7,7 @@ The package is split into a frontend-agnostic data layer (`core`) and frontends
 
 from __future__ import annotations
 
-from .cli import main
+from .__main__ import main
 from .core import (
     GhClient,
     GhError,

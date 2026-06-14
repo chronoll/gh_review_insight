@@ -14,7 +14,7 @@ license = { text = "MIT" }
 dependencies = []
 
 [project.scripts]
-gh-review-insight = "gh_review_insight.cli:main"
+gh-review-insight = "gh_review_insight.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["gh_review_insight"]

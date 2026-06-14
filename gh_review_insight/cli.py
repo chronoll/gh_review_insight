@@ -23,6 +23,11 @@ from .core import (
 )
 
 
+# Subcommands exposed by the CLI. Used both here and by the entry-point dispatch
+# in __main__ to decide between CLI and TUI mode.
+COMMANDS = ("status", "stats")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gh-review-insight",
