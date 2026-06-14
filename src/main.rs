@@ -14,6 +14,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "gh-review-insight",
         native_options,
-        Box::new(|_cc| Ok(Box::new(app::App::new("gh".to_string())))),
+        Box::new(|cc| {
+            app::install_japanese_font(&cc.egui_ctx);
+            Ok(Box::new(app::App::new("gh".to_string())))
+        }),
     )
 }

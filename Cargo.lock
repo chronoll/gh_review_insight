@@ -1205,6 +1205,7 @@ dependencies = [
 name = "gh-review-insight"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "chrono",
  "eframe",

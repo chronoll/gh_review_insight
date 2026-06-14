@@ -8,6 +8,7 @@
 //! Fetching runs on a background thread and the result is delivered over a
 //! channel, so the gh subprocess never blocks the UI thread.
 
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui;
@@ -16,6 +17,39 @@ use egui_extras::{Column, TableBuilder};
 use crate::core::{StatsOptions, StatusOptions, collect_stats, collect_status};
 use crate::gh::GhClient;
 use crate::model::{PullRequestSummary, Stats, short_state};
+
+/// macOS system fonts that include Japanese glyphs, in order of preference.
+/// `.ttc` collections are loaded at face index 0 (egui passes the index to
+/// ab_glyph). Read at startup so the repo doesn't bundle a font.
+const JP_FONT_CANDIDATES: &[&str] = &[
+    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+];
+
+/// Register a Japanese-capable font as the highest-priority face so labels
+/// render instead of showing tofu (□). Falls back silently if none is found.
+pub fn install_japanese_font(ctx: &egui::Context) {
+    let Some(bytes) = JP_FONT_CANDIDATES.iter().find_map(|path| std::fs::read(path).ok()) else {
+        eprintln!("warning: 日本語フォントが見つかりませんでした（日本語が□で表示されます）。");
+        return;
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("japanese".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, "japanese".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -374,4 +408,24 @@ fn detail_text(pr: &PullRequestSummary) -> String {
         }
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JP_FONT_CANDIDATES;
+    use ab_glyph::{Font, FontVec};
+
+    #[test]
+    fn a_japanese_font_with_kana_and_kanji_is_available() {
+        let bytes = JP_FONT_CANDIDATES
+            .iter()
+            .find_map(|path| std::fs::read(path).ok())
+            .expect("日本語フォント候補が一つも見つかりませんでした");
+        // index 0 mirrors how egui loads .ttc collections.
+        let font = FontVec::try_from_vec_and_index(bytes, 0).expect("フォントを解析できませんでした");
+        // glyph_id returns id 0 (.notdef) when the character is missing.
+        for ch in ['あ', 'ア', '漢', 'レ'] {
+            assert_ne!(font.glyph_id(ch).0, 0, "'{ch}' のグリフがありません");
+        }
+    }
 }
