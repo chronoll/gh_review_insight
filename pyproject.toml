@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gh-review-insight"
+version = "0.1.0"
+description = "GitHub review requests and review activity from the terminal."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# Core + CLI deliberately have no third-party dependencies; transport is
+# delegated to the `gh` CLI at runtime.
+dependencies = []
+
+[project.scripts]
+gh-review-insight = "gh_review_insight.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gh_review_insight"]
