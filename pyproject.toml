@@ -13,6 +13,10 @@ license = { text = "MIT" }
 # delegated to the `gh` CLI at runtime.
 dependencies = []
 
+[project.optional-dependencies]
+# The interactive TUI. Install with: pip install 'gh-review-insight[tui]'
+tui = ["textual>=0.60"]
+
 [project.scripts]
 gh-review-insight = "gh_review_insight.__main__:main"
 

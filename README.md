@@ -2,7 +2,7 @@
 
 GitHub のレビューリクエストと自分のレビュー実績を確認するための小さなCLIです。
 
-既存の `gh` CLI を認証とAPIアクセスに使うため、このツール自体は追加依存を持ちません。
+既存の `gh` CLI を認証とAPIアクセスに使うため、コアとCLIは追加依存を持ちません。対話的に使う TUI だけ、オプションで `textual` を利用します。
 
 ## 位置づけ
 
@@ -19,12 +19,13 @@ GitHub のレビューリクエストと自分のレビュー実績を確認す�
 - Python 3.10+
 - GitHub CLI (`gh`)
 - `gh auth login` 済みであること
+- TUI を使う場合のみ `textual`（`pip install 'gh-review-insight[tui]'`）
 
 ## Usage
 
 ```bash
 cd /Users/michika.kurotaka/Private/sandbox/gh-review-insight
-python3 gh_review_insight.py status
+python3 -m gh_review_insight status
 ```
 
 実行ファイルとして使う場合:
@@ -54,6 +55,28 @@ JSON / CSV:
 ./gh-review-insight stats --days 30
 ./gh-review-insight --owner my-org stats --since 2026-01-01 --until 2026-06-14
 ```
+
+## TUI
+
+`gh-review-insight` を引数なしで実行すると、対話的な TUI が起動します（対話端末のときのみ）。
+
+```bash
+pip install 'gh-review-insight[tui]'
+gh-review-insight                  # 引数なし → TUI
+gh-review-insight --owner my-org   # スコープを絞って TUI
+```
+
+キー操作:
+
+- `j` / `k`・矢印: 行移動
+- `Enter`: 選択中の PR をブラウザで開く
+- `o`: 選択中の PR をブラウザで開く
+- `r`: 再取得
+- `s`: status ⇄ stats 切り替え
+- `/`: フィルタ（タイトル / リポジトリ / 作者）。`Esc` で解除
+- `q`: 終了
+
+パイプや非対話端末で引数なし実行した場合は TUI を起動せず、サブコマンドの利用を促します。AI やスクリプトからは `status` / `stats`（必要に応じて `--json`）を使ってください。
 
 ## Commands
 
