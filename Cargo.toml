@@ -1,0 +1,12 @@
+[package]
+name = "gh-review-insight"
+version = "0.1.0"
+edition = "2024"
+description = "GitHub のレビュー依頼状況とレビュー実績を確認する GUI（データ取得は gh CLI に委譲）"
+
+[dependencies]
+anyhow = "1.0.102"
+chrono = "0.4.45"
+eframe = "0.32.3"
+egui_extras = "0.32.3"
+serde_json = "1.0.150"
