@@ -1,9 +1,21 @@
+mod app;
 mod core;
 mod gh;
 mod model;
 
-fn main() {
-    // The egui GUI is wired up in the next step; for now this is a placeholder
-    // so the core layer can be built and unit-tested in isolation.
-    println!("gh-review-insight: GUI is implemented in the next commit.");
+fn main() -> eframe::Result<()> {
+    let opts = crate::core::StatusOptions::default();
+
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 700.0])
+            .with_title("gh-review-insight"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "gh-review-insight",
+        native_options,
+        Box::new(|_cc| Ok(Box::new(app::App::new(opts, "gh".to_string())))),
+    )
 }
