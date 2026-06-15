@@ -30,14 +30,58 @@ pub struct PullRequestSummary {
     pub other_latest_reviews: Vec<ReviewSummary>,
 }
 
+/// The viewer's actionable relationship to a PR.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReviewStatus {
+    /// Requested, but nobody has reviewed yet.
+    RequestedUntouched,
+    /// Requested, the viewer hasn't reviewed but someone else has.
+    RequestedOthersReviewed,
+    /// The viewer has reviewed it.
+    Reviewed,
+    /// Anything else (e.g. seen but not requested and not reviewed).
+    Other,
+}
+
+impl ReviewStatus {
+    /// Short label for the status column.
+    pub fn label(self) -> &'static str {
+        match self {
+            ReviewStatus::RequestedUntouched => "要レビュー",
+            ReviewStatus::RequestedOthersReviewed => "要レビュー(他者済)",
+            ReviewStatus::Reviewed => "レビュー済",
+            ReviewStatus::Other => "—",
+        }
+    }
+
+    /// Full sentence used for tooltips.
+    pub fn description(self) -> &'static str {
+        match self {
+            ReviewStatus::RequestedUntouched => "リクエストがあるが誰もレビューしていない",
+            ReviewStatus::RequestedOthersReviewed => {
+                "リクエストがあり自分はレビューしていないが、誰かがレビューした"
+            }
+            ReviewStatus::Reviewed => "リクエストがあり自分がレビューした（またはレビュー済み）",
+            ReviewStatus::Other => "その他",
+        }
+    }
+}
+
 impl PullRequestSummary {
-    /// The viewer's relationship to this PR: requested / reviewed / both / seen.
-    pub fn self_status(&self) -> &'static str {
-        match (self.requested_for_user, self.my_latest_review.is_some()) {
-            (true, true) => "reviewed+requested",
-            (true, false) => "requested",
-            (false, true) => "reviewed",
-            (false, false) => "seen",
+    /// Classify the viewer's relationship to this PR. Having reviewed it takes
+    /// precedence; otherwise a standing request is split by whether anyone else
+    /// has reviewed.
+    pub fn review_status(&self) -> ReviewStatus {
+        if self.my_latest_review.is_some() {
+            ReviewStatus::Reviewed
+        } else if self.requested_for_user {
+            if self.other_latest_reviews.is_empty() {
+                ReviewStatus::RequestedUntouched
+            } else {
+                ReviewStatus::RequestedOthersReviewed
+            }
+        } else {
+            ReviewStatus::Other
         }
     }
 

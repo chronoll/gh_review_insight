@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::gh::{GhClient, GqlVar};
-use crate::model::{PullRequestSummary, ReviewSummary, Stats};
+use crate::model::{PullRequestSummary, ReviewStatus, ReviewSummary, Stats};
 
 const PR_SEARCH_QUERY: &str = r#"
 query($searchQuery: String!, $first: Int!, $after: String) {
@@ -213,12 +213,12 @@ pub fn collect_status(
 }
 
 fn status_priority(summary: &PullRequestSummary) -> i32 {
-    match summary.self_status() {
-        "requested" => 0,
-        "reviewed+requested" => 1,
-        "reviewed" => 2,
-        "seen" => 3,
-        _ => 9,
+    // Untouched requests are the most actionable, so they sort first.
+    match summary.review_status() {
+        ReviewStatus::RequestedUntouched => 0,
+        ReviewStatus::RequestedOthersReviewed => 1,
+        ReviewStatus::Reviewed => 2,
+        ReviewStatus::Other => 3,
     }
 }
 
@@ -526,7 +526,8 @@ mod tests {
             &["requested".to_string(), "reviewed".to_string()],
         );
 
-        assert_eq!(summary.self_status(), "reviewed+requested");
+        // bob has his own latest review (APPROVED) -> Reviewed.
+        assert_eq!(summary.review_status(), ReviewStatus::Reviewed);
         assert_eq!(summary.my_latest_review.as_ref().unwrap().state, "APPROVED");
         assert_eq!(
             summary.requested_reviewers,
@@ -537,12 +538,39 @@ mod tests {
     }
 
     #[test]
-    fn summarize_for_non_reviewer_marks_seen_when_not_requested() {
+    fn summarize_for_non_reviewer_not_requested_is_other() {
         let summary = summarize_pull_request(&fixture_pr(), "dave", &["reviewed".to_string()]);
-        // dave neither requested nor has a review -> "seen".
-        assert_eq!(summary.self_status(), "seen");
+        // dave neither requested nor reviewed -> Other.
+        assert_eq!(summary.review_status(), ReviewStatus::Other);
         assert!(summary.my_latest_review.is_none());
         assert_eq!(summary.other_latest_reviews.len(), 2);
+    }
+
+    #[test]
+    fn requested_without_any_review_is_untouched() {
+        // A PR requesting "erin" with no reviews submitted yet.
+        let node = json!({
+            "author": {"login": "alice"},
+            "createdAt": "2026-06-01T00:00:00Z",
+            "isDraft": false,
+            "number": 7,
+            "repository": {"nameWithOwner": "acme/widgets"},
+            "reviewDecision": "REVIEW_REQUIRED",
+            "reviewRequests": {"nodes": [
+                {"requestedReviewer": {"__typename": "User", "login": "erin"}}
+            ]},
+            "reviews": {"nodes": []},
+            "state": "OPEN",
+            "title": "WIP",
+            "updatedAt": "2026-06-02T00:00:00Z",
+            "url": "https://github.com/acme/widgets/pull/7"
+        });
+        let summary = summarize_pull_request(&node, "erin", &["requested".to_string()]);
+        assert_eq!(summary.review_status(), ReviewStatus::RequestedUntouched);
+
+        // With someone else's review present, it becomes "others reviewed".
+        let summary2 = summarize_pull_request(&fixture_pr(), "erin", &["requested".to_string()]);
+        assert_eq!(summary2.review_status(), ReviewStatus::RequestedOthersReviewed);
     }
 
     #[test]

@@ -251,7 +251,8 @@ impl App {
                 for pr in &rows {
                     body.row(22.0, |mut row| {
                         row.col(|ui| {
-                            ui.label(pr.self_status());
+                            ui.label(pr.review_status().label())
+                                .on_hover_text(pr.review_status().description());
                         });
                         row.col(|ui| {
                             ui.hyperlink_to(pr.pr_key(), pr.url.as_str())
