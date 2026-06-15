@@ -8,6 +8,7 @@
 //! Fetching runs on a background thread and the result is delivered over a
 //! channel, so the gh subprocess never blocks the UI thread.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -16,7 +17,7 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::core::{StatsOptions, StatusOptions, collect_stats, collect_status};
 use crate::gh::GhClient;
-use crate::model::{PullRequestSummary, Stats, short_state};
+use crate::model::{PullRequestSummary, ReviewStatus, Stats, short_state};
 
 /// macOS system fonts that include Japanese glyphs, in order of preference.
 /// `.ttc` collections are loaded at face index 0 (egui passes the index to
@@ -82,6 +83,8 @@ pub struct App {
     rx: Option<Receiver<FetchResult>>,
     filter: String,
     started: bool,
+    /// Per-user text colors (sRGB), keyed by GitHub login.
+    colors: HashMap<String, [u8; 3]>,
 }
 
 impl App {
@@ -98,6 +101,7 @@ impl App {
             rx: None,
             filter: String::new(),
             started: false,
+            colors: HashMap::new(),
         }
     }
 
@@ -230,18 +234,23 @@ impl App {
             return;
         }
 
+        let dark = ui.visuals().dark_mode;
+
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
             .column(Column::auto()) // status
             .column(Column::auto()) // PR
+            .column(Column::auto()) // author
             .column(Column::auto()) // mine
             .column(Column::auto()) // others
             .column(Column::auto()) // requested
             .column(Column::auto()) // updated
             .column(Column::remainder()) // title
             .header(20.0, |mut header| {
-                for label in ["status", "PR", "mine", "others", "requested", "updated", "title"] {
+                for label in [
+                    "status", "PR", "author", "mine", "others", "requested", "updated", "title",
+                ] {
                     header.col(|ui| {
                         ui.strong(label);
                     });
@@ -249,16 +258,24 @@ impl App {
             })
             .body(|mut body| {
                 for pr in &rows {
+                    let tint = status_tint(pr.review_status(), dark);
                     body.row(22.0, |mut row| {
                         row.col(|ui| {
+                            fill_cell(ui, tint);
                             ui.label(pr.review_status().label())
                                 .on_hover_text(pr.review_status().description());
                         });
                         row.col(|ui| {
+                            fill_cell(ui, tint);
                             ui.hyperlink_to(pr.pr_key(), pr.url.as_str())
                                 .on_hover_text(detail_text(pr));
                         });
                         row.col(|ui| {
+                            fill_cell(ui, tint);
+                            self.user_label(ui, &pr.author);
+                        });
+                        row.col(|ui| {
+                            fill_cell(ui, tint);
                             ui.label(
                                 pr.my_latest_review
                                     .as_ref()
@@ -267,9 +284,11 @@ impl App {
                             );
                         });
                         row.col(|ui| {
-                            ui.label(others_text(pr));
+                            fill_cell(ui, tint);
+                            self.others_cell(ui, pr);
                         });
                         row.col(|ui| {
+                            fill_cell(ui, tint);
                             ui.label(if pr.requested_reviewers.is_empty() {
                                 "-".to_string()
                             } else {
@@ -277,15 +296,53 @@ impl App {
                             });
                         });
                         row.col(|ui| {
+                            fill_cell(ui, tint);
                             ui.label(date10(&pr.updated_at));
                         });
                         row.col(|ui| {
+                            fill_cell(ui, tint);
                             ui.hyperlink_to(pr.title.as_str(), pr.url.as_str())
                                 .on_hover_text(detail_text(pr));
                         });
                     });
                 }
             });
+    }
+
+    /// A user name, colored if the user has a custom color assigned.
+    fn user_label(&self, ui: &mut egui::Ui, user: &str) {
+        match self.user_color(user) {
+            Some(color) => {
+                ui.colored_label(color, user);
+            }
+            None => {
+                ui.label(user);
+            }
+        }
+    }
+
+    /// The "others" column: each reviewer name colored individually.
+    fn others_cell(&self, ui: &mut egui::Ui, pr: &PullRequestSummary) {
+        if pr.other_latest_reviews.is_empty() {
+            ui.label("-");
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for review in &pr.other_latest_reviews {
+                let text = format!("{}:{}", review.author, short_state(&review.state));
+                match self.user_color(&review.author) {
+                    Some(color) => ui.colored_label(color, text),
+                    None => ui.label(text),
+                };
+            }
+        });
+    }
+
+    fn user_color(&self, user: &str) -> Option<egui::Color32> {
+        self.colors
+            .get(user)
+            .map(|[r, g, b]| egui::Color32::from_rgb(*r, *g, *b))
     }
 
     fn stats_view(&self, ui: &mut egui::Ui, stats: &Stats) {
@@ -362,15 +419,33 @@ fn date10(value: &str) -> String {
     value.chars().take(10).collect()
 }
 
-fn others_text(pr: &PullRequestSummary) -> String {
-    if pr.other_latest_reviews.is_empty() {
-        return "-".to_string();
+/// Paint a full-cell background so an entire row reads as one color.
+fn fill_cell(ui: &egui::Ui, tint: Option<egui::Color32>) {
+    if let Some(color) = tint {
+        ui.painter()
+            .rect_filled(ui.available_rect_before_wrap(), 0.0, color);
     }
-    pr.other_latest_reviews
-        .iter()
-        .map(|review| format!("{}:{}", review.author, short_state(&review.state)))
-        .collect::<Vec<_>>()
-        .join(", ")
+}
+
+/// Faint row background per status (None = no tint). Tuned for both themes.
+fn status_tint(status: ReviewStatus, dark: bool) -> Option<egui::Color32> {
+    use egui::Color32;
+    let color = match (status, dark) {
+        (ReviewStatus::RequestedUntouched, true) => Color32::from_rgba_unmultiplied(190, 70, 70, 48),
+        (ReviewStatus::RequestedUntouched, false) => {
+            Color32::from_rgba_unmultiplied(220, 120, 120, 80)
+        }
+        (ReviewStatus::RequestedOthersReviewed, true) => {
+            Color32::from_rgba_unmultiplied(190, 160, 60, 44)
+        }
+        (ReviewStatus::RequestedOthersReviewed, false) => {
+            Color32::from_rgba_unmultiplied(230, 200, 120, 90)
+        }
+        (ReviewStatus::Reviewed, true) => Color32::from_rgba_unmultiplied(80, 150, 90, 40),
+        (ReviewStatus::Reviewed, false) => Color32::from_rgba_unmultiplied(170, 220, 180, 90),
+        (ReviewStatus::Other, _) => return None,
+    };
+    Some(color)
 }
 
 fn detail_text(pr: &PullRequestSummary) -> String {
