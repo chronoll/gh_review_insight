@@ -23,8 +23,11 @@ use crate::model::{PullRequestSummary, ReviewStatus, Stats, short_state};
 /// `.ttc` collections are loaded at face index 0 (egui passes the index to
 /// ab_glyph). Read at startup so the repo doesn't bundle a font.
 const JP_FONT_CANDIDATES: &[&str] = &[
-    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+    // Prefer a heavier weight so all text (Latin + Japanese) reads as bold.
+    "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W5.ttc",
     "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     "/Library/Fonts/Arial Unicode.ttf",
@@ -85,9 +88,12 @@ pub struct App {
     started: bool,
     /// Per-user text colors (sRGB), keyed by GitHub login.
     colors: HashMap<String, [u8; 3]>,
+    /// PR / repo URLs to hide from the status list.
+    excludes: Vec<String>,
     /// Settings window state.
     show_settings: bool,
     new_user: String,
+    new_exclude: String,
 }
 
 impl App {
@@ -105,8 +111,10 @@ impl App {
             filter: String::new(),
             started: false,
             colors: load_colors(),
+            excludes: load_excludes(),
             show_settings: false,
             new_user: String::new(),
+            new_exclude: String::new(),
         }
     }
 
@@ -229,6 +237,7 @@ impl App {
         let needle = self.filter.to_lowercase();
         let rows: Vec<&PullRequestSummary> = prs
             .iter()
+            .filter(|pr| !self.is_excluded(&pr.url))
             .filter(|pr| {
                 needle.is_empty()
                     || format!("{} {} {}", pr.title, pr.repository, pr.author)
@@ -251,10 +260,10 @@ impl App {
             .column(Column::auto()) // PR
             .column(Column::auto()) // author
             .column(Column::auto()) // mine
-            .column(Column::auto()) // others
-            .column(Column::auto()) // requested
+            .column(Column::auto().at_least(80.0).at_most(220.0).clip(true)) // others
+            .column(Column::auto().at_least(80.0).at_most(220.0).clip(true)) // requested
             .column(Column::auto()) // updated
-            .column(Column::remainder()) // title
+            .column(Column::remainder().clip(true)) // title
             .header(20.0, |mut header| {
                 for label in [
                     "status", "PR", "author", "mine", "others", "requested", "updated", "title",
@@ -267,7 +276,7 @@ impl App {
             .body(|mut body| {
                 for pr in &rows {
                     let tint = status_tint(pr.review_status(), dark);
-                    body.row(22.0, |mut row| {
+                    body.row(24.0, |mut row| {
                         row.col(|ui| {
                             fill_cell(ui, tint);
                             ui.label(pr.review_status().label())
@@ -297,11 +306,13 @@ impl App {
                         });
                         row.col(|ui| {
                             fill_cell(ui, tint);
-                            ui.label(if pr.requested_reviewers.is_empty() {
+                            let text = if pr.requested_reviewers.is_empty() {
                                 "-".to_string()
                             } else {
                                 pr.requested_reviewers.join(", ")
-                            });
+                            };
+                            ui.add(egui::Label::new(text.as_str()).truncate())
+                                .on_hover_text(text);
                         });
                         row.col(|ui| {
                             fill_cell(ui, tint);
@@ -329,22 +340,32 @@ impl App {
         }
     }
 
-    /// The "others" column: each reviewer name colored individually.
+    /// The "others" column: each reviewer name colored individually on a single
+    /// line (the column clips; the full list is shown on hover).
     fn others_cell(&self, ui: &mut egui::Ui, pr: &PullRequestSummary) {
         if pr.other_latest_reviews.is_empty() {
             ui.label("-");
             return;
         }
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for review in &pr.other_latest_reviews {
-                let text = format!("{}:{}", review.author, short_state(&review.state));
-                match self.user_color(&review.author) {
-                    Some(color) => ui.colored_label(color, text),
-                    None => ui.label(text),
-                };
-            }
-        });
+        let full = pr
+            .other_latest_reviews
+            .iter()
+            .map(|r| format!("{}:{}", r.author, short_state(&r.state)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let response = ui
+            .horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for review in &pr.other_latest_reviews {
+                    let text = format!("{}:{}", review.author, short_state(&review.state));
+                    match self.user_color(&review.author) {
+                        Some(color) => ui.colored_label(color, text),
+                        None => ui.label(text),
+                    };
+                }
+            })
+            .response;
+        response.on_hover_text(full);
     }
 
     fn user_color(&self, user: &str) -> Option<egui::Color32> {
@@ -392,12 +413,16 @@ impl App {
 
         let users = self.known_users();
         let snapshot = self.colors.clone();
+        let excludes_snapshot = self.excludes.clone();
         let mut open = self.show_settings;
         // Collected outside the closures, then applied to `self` afterwards, so
         // we never borrow `self` across nested egui closures.
         let mut edits: Vec<(String, Option<[u8; 3]>)> = Vec::new();
         let mut add_user: Option<String> = None;
+        let mut add_exclude: Option<String> = None;
+        let mut remove_exclude: Option<String> = None;
         let new_user = &mut self.new_user;
+        let new_exclude = &mut self.new_exclude;
 
         egui::Window::new("ユーザー色設定")
             .open(&mut open)
@@ -438,6 +463,26 @@ impl App {
                         }
                     }
                 });
+
+                ui.separator();
+                ui.label("一覧から除外する GitHub リンク（PR またはリポジトリの URL）:");
+                for url in &excludes_snapshot {
+                    ui.horizontal(|ui| {
+                        if ui.button("解除").clicked() {
+                            remove_exclude = Some(url.clone());
+                        }
+                        ui.label(url);
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(new_exclude);
+                    if ui.button("除外に追加").clicked() {
+                        let trimmed = new_exclude.trim();
+                        if !trimmed.is_empty() {
+                            add_exclude = Some(trimmed.to_string());
+                        }
+                    }
+                });
             });
 
         let mut changed = false;
@@ -457,10 +502,27 @@ impl App {
             self.new_user.clear();
             changed = true;
         }
-        self.show_settings = open;
         if changed {
             self.save_colors();
         }
+
+        let mut excludes_changed = false;
+        if let Some(url) = add_exclude {
+            if !self.excludes.iter().any(|e| e == &url) {
+                self.excludes.push(url);
+            }
+            self.new_exclude.clear();
+            excludes_changed = true;
+        }
+        if let Some(url) = remove_exclude {
+            self.excludes.retain(|e| e != &url);
+            excludes_changed = true;
+        }
+        if excludes_changed {
+            self.save_excludes();
+        }
+
+        self.show_settings = open;
     }
 
     fn save_colors(&self) {
@@ -471,6 +533,27 @@ impl App {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(&self.colors) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    /// True when a PR should be hidden. An entry matches the exact PR URL or,
+    /// when it's a repo URL, any PR under it.
+    fn is_excluded(&self, url: &str) -> bool {
+        self.excludes.iter().any(|raw| {
+            let needle = raw.trim().trim_end_matches('/');
+            !needle.is_empty() && (url == needle || url.starts_with(&format!("{needle}/")))
+        })
+    }
+
+    fn save_excludes(&self) {
+        let Some(path) = excludes_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&self.excludes) {
             let _ = std::fs::write(path, json);
         }
     }
@@ -560,34 +643,47 @@ fn load_colors() -> HashMap<String, [u8; 3]> {
         .unwrap_or_default()
 }
 
+/// Where excluded URLs are persisted: `$HOME/.config/gh-review-insight/excludes.json`.
+fn excludes_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".config/gh-review-insight/excludes.json"))
+}
+
+fn load_excludes() -> Vec<String> {
+    excludes_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
 fn date10(value: &str) -> String {
     value.chars().take(10).collect()
 }
 
-/// Paint a full-cell background so an entire row reads as one color.
+/// Paint the whole cell background (full width and height) with a faint tint.
 fn fill_cell(ui: &egui::Ui, tint: Option<egui::Color32>) {
     if let Some(color) = tint {
-        ui.painter()
-            .rect_filled(ui.available_rect_before_wrap(), 0.0, color);
+        ui.painter().rect_filled(ui.max_rect(), 0.0, color);
     }
 }
 
-/// Faint row background per status (None = no tint). Tuned for both themes.
+/// Very faint per-cell background per status (None = no tint). Subtle on
+/// purpose, tuned for both themes.
 fn status_tint(status: ReviewStatus, dark: bool) -> Option<egui::Color32> {
     use egui::Color32;
     let color = match (status, dark) {
-        (ReviewStatus::RequestedUntouched, true) => Color32::from_rgba_unmultiplied(190, 70, 70, 48),
+        (ReviewStatus::RequestedUntouched, true) => Color32::from_rgba_unmultiplied(200, 80, 80, 22),
         (ReviewStatus::RequestedUntouched, false) => {
-            Color32::from_rgba_unmultiplied(220, 120, 120, 80)
+            Color32::from_rgba_unmultiplied(220, 110, 110, 30)
         }
         (ReviewStatus::RequestedOthersReviewed, true) => {
-            Color32::from_rgba_unmultiplied(190, 160, 60, 44)
+            Color32::from_rgba_unmultiplied(205, 170, 70, 20)
         }
         (ReviewStatus::RequestedOthersReviewed, false) => {
-            Color32::from_rgba_unmultiplied(230, 200, 120, 90)
+            Color32::from_rgba_unmultiplied(225, 190, 110, 30)
         }
-        (ReviewStatus::Reviewed, true) => Color32::from_rgba_unmultiplied(80, 150, 90, 40),
-        (ReviewStatus::Reviewed, false) => Color32::from_rgba_unmultiplied(170, 220, 180, 90),
+        (ReviewStatus::Reviewed, true) => Color32::from_rgba_unmultiplied(90, 165, 100, 18),
+        (ReviewStatus::Reviewed, false) => Color32::from_rgba_unmultiplied(150, 205, 160, 28),
         (ReviewStatus::Other, _) => return None,
     };
     Some(color)

@@ -47,9 +47,9 @@ impl ReviewStatus {
     /// Short label for the status column.
     pub fn label(self) -> &'static str {
         match self {
-            ReviewStatus::RequestedUntouched => "要レビュー",
-            ReviewStatus::RequestedOthersReviewed => "要レビュー(他者済)",
-            ReviewStatus::Reviewed => "レビュー済",
+            ReviewStatus::RequestedUntouched => "waiting",
+            ReviewStatus::RequestedOthersReviewed => "should",
+            ReviewStatus::Reviewed => "finished",
             ReviewStatus::Other => "—",
         }
     }
