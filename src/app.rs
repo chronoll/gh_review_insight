@@ -85,6 +85,9 @@ pub struct App {
     started: bool,
     /// Per-user text colors (sRGB), keyed by GitHub login.
     colors: HashMap<String, [u8; 3]>,
+    /// Settings window state.
+    show_settings: bool,
+    new_user: String,
 }
 
 impl App {
@@ -101,7 +104,9 @@ impl App {
             rx: None,
             filter: String::new(),
             started: false,
-            colors: HashMap::new(),
+            colors: load_colors(),
+            show_settings: false,
+            new_user: String::new(),
         }
     }
 
@@ -179,6 +184,9 @@ impl App {
             }
             if ui.button("⟳ 更新").clicked() {
                 self.start_fetch(ctx);
+            }
+            if ui.button("⚙ 設定").clicked() {
+                self.show_settings = !self.show_settings;
             }
             ui.separator();
 
@@ -345,6 +353,128 @@ impl App {
             .map(|[r, g, b]| egui::Color32::from_rgb(*r, *g, *b))
     }
 
+    /// Logins seen in the current data, plus any already-colored ones.
+    fn known_users(&self) -> Vec<String> {
+        let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if !self.login.is_empty() {
+            set.insert(self.login.clone());
+        }
+        if let ViewState::Ready(Loaded::Status(prs)) = &self.state {
+            for pr in prs {
+                if !pr.author.is_empty() {
+                    set.insert(pr.author.clone());
+                }
+                if let Some(review) = &pr.my_latest_review {
+                    set.insert(review.author.clone());
+                }
+                for review in &pr.other_latest_reviews {
+                    set.insert(review.author.clone());
+                }
+                for requested in &pr.requested_reviewers {
+                    let name = requested.trim_start_matches('@');
+                    // Skip teams (e.g. @org/platform).
+                    if !name.is_empty() && !name.contains('/') {
+                        set.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        for user in self.colors.keys() {
+            set.insert(user.clone());
+        }
+        set.into_iter().collect()
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+
+        let users = self.known_users();
+        let snapshot = self.colors.clone();
+        let mut open = self.show_settings;
+        // Collected outside the closures, then applied to `self` afterwards, so
+        // we never borrow `self` across nested egui closures.
+        let mut edits: Vec<(String, Option<[u8; 3]>)> = Vec::new();
+        let mut add_user: Option<String> = None;
+        let new_user = &mut self.new_user;
+
+        egui::Window::new("ユーザー色設定")
+            .open(&mut open)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label("ユーザー名ごとに文字色を設定できます（author と reviewer 名に反映）。");
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    egui::Grid::new("user_colors")
+                        .num_columns(3)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            for user in &users {
+                                ui.label(user);
+                                let mut rgb = snapshot.get(user).copied().unwrap_or([220, 220, 220]);
+                                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                    edits.push((user.clone(), Some(rgb)));
+                                }
+                                if snapshot.contains_key(user) {
+                                    if ui.button("解除").clicked() {
+                                        edits.push((user.clone(), None));
+                                    }
+                                } else {
+                                    ui.label("");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("ユーザー追加:");
+                    ui.text_edit_singleline(new_user);
+                    if ui.button("追加").clicked() {
+                        let trimmed = new_user.trim();
+                        if !trimmed.is_empty() {
+                            add_user = Some(trimmed.to_string());
+                        }
+                    }
+                });
+            });
+
+        let mut changed = false;
+        for (user, color) in edits {
+            match color {
+                Some(rgb) => {
+                    self.colors.insert(user, rgb);
+                }
+                None => {
+                    self.colors.remove(&user);
+                }
+            }
+            changed = true;
+        }
+        if let Some(user) = add_user {
+            self.colors.entry(user).or_insert([255, 255, 255]);
+            self.new_user.clear();
+            changed = true;
+        }
+        self.show_settings = open;
+        if changed {
+            self.save_colors();
+        }
+    }
+
+    fn save_colors(&self) {
+        let Some(path) = colors_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&self.colors) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
     fn stats_view(&self, ui: &mut egui::Ui, stats: &Stats) {
         egui::Grid::new("stats_grid")
             .num_columns(2)
@@ -412,7 +542,22 @@ impl eframe::App for App {
             ViewState::Ready(Loaded::Status(prs)) => self.table(ui, prs),
             ViewState::Ready(Loaded::Stats(stats)) => self.stats_view(ui, stats),
         });
+
+        self.settings_window(ctx);
     }
+}
+
+/// Where per-user colors are persisted: `$HOME/.config/gh-review-insight/colors.json`.
+fn colors_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".config/gh-review-insight/colors.json"))
+}
+
+fn load_colors() -> HashMap<String, [u8; 3]> {
+    colors_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 fn date10(value: &str) -> String {
@@ -503,5 +648,16 @@ mod tests {
         for ch in ['あ', 'ア', '漢', 'レ'] {
             assert_ne!(font.glyph_id(ch).0, 0, "'{ch}' のグリフがありません");
         }
+    }
+
+    #[test]
+    fn user_colors_serialize_roundtrip() {
+        // The persistence format (HashMap<String, [u8; 3]> via serde_json).
+        let mut map: std::collections::HashMap<String, [u8; 3]> = std::collections::HashMap::new();
+        map.insert("alice".to_string(), [10, 20, 30]);
+        let json = serde_json::to_string(&map).expect("serialize");
+        let back: std::collections::HashMap<String, [u8; 3]> =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.get("alice"), Some(&[10, 20, 30]));
     }
 }
