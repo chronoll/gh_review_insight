@@ -440,34 +440,37 @@ impl App {
         let new_exclude = &mut self.new_exclude;
         let new_ignored = &mut self.new_ignored;
 
+        // Keep the window within the screen and scroll its whole body when the
+        // lists (colors / excludes / ignored) grow tall.
+        let max_height = (ctx.screen_rect().height() - 80.0).max(200.0);
         egui::Window::new("ユーザー色設定")
             .open(&mut open)
             .resizable(true)
+            .vscroll(true)
+            .max_height(max_height)
             .show(ctx, |ui| {
                 ui.label("ユーザー名ごとに文字色を設定できます（author と reviewer 名に反映）。");
                 ui.separator();
-                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                    egui::Grid::new("user_colors")
-                        .num_columns(3)
-                        .spacing([12.0, 6.0])
-                        .show(ui, |ui| {
-                            for user in &users {
-                                ui.label(user);
-                                let mut rgb = snapshot.get(user).copied().unwrap_or([220, 220, 220]);
-                                if ui.color_edit_button_srgb(&mut rgb).changed() {
-                                    edits.push((user.clone(), Some(rgb)));
-                                }
-                                if snapshot.contains_key(user) {
-                                    if ui.button("解除").clicked() {
-                                        edits.push((user.clone(), None));
-                                    }
-                                } else {
-                                    ui.label("");
-                                }
-                                ui.end_row();
+                egui::Grid::new("user_colors")
+                    .num_columns(3)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        for user in &users {
+                            ui.label(user);
+                            let mut rgb = snapshot.get(user).copied().unwrap_or([220, 220, 220]);
+                            if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                edits.push((user.clone(), Some(rgb)));
                             }
-                        });
-                });
+                            if snapshot.contains_key(user) {
+                                if ui.button("解除").clicked() {
+                                    edits.push((user.clone(), None));
+                                }
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
+                        }
+                    });
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("ユーザー追加:");
