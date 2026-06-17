@@ -74,6 +74,8 @@ pub struct StatusOptions {
     pub include_drafts: bool,
     pub no_reviewed: bool,
     pub limit: usize,
+    /// Reviewer logins to ignore (e.g. bots), excluded from review counting.
+    pub ignored: Vec<String>,
 }
 
 impl Default for StatusOptions {
@@ -85,6 +87,7 @@ impl Default for StatusOptions {
             include_drafts: false,
             no_reviewed: false,
             limit: 50,
+            ignored: Vec::new(),
         }
     }
 }
@@ -194,7 +197,7 @@ pub fn collect_status(
         .map(|url| {
             let (node, sources) = &by_url[url];
             let sources: Vec<String> = sources.iter().cloned().collect();
-            summarize_pull_request(node, &login, &sources)
+            summarize_pull_request(node, &login, &sources, &opts.ignored)
         })
         .collect();
 
@@ -223,10 +226,15 @@ fn status_priority(summary: &PullRequestSummary) -> i32 {
 }
 
 /// Turn a raw search node into a `PullRequestSummary` for the given viewer.
+///
+/// Reviews authored by anyone in `ignored` (e.g. bots like coderabbit) are
+/// dropped entirely, so they affect neither the status classification, the
+/// "others" column, nor the stats aggregation.
 pub fn summarize_pull_request(
     node: &Value,
     login: &str,
     sources: &[String],
+    ignored: &[String],
 ) -> PullRequestSummary {
     let request_nodes = node["reviewRequests"]["nodes"]
         .as_array()
@@ -237,7 +245,8 @@ pub fn summarize_pull_request(
         .filter_map(format_requested_reviewer)
         .collect();
 
-    let reviews = parse_reviews(node);
+    let mut reviews = parse_reviews(node);
+    reviews.retain(|review| !ignored.iter().any(|name| name == &review.author));
     let latest_by_author = latest_reviews_by_author(&reviews);
     let my_latest_review = latest_by_author.get(login).cloned();
     // BTreeMap iterates in author order, matching the Python `sorted(...)`.
@@ -335,6 +344,8 @@ pub struct StatsOptions {
     pub owners: Vec<String>,
     pub days: i64,
     pub limit: usize,
+    /// Reviewer logins to ignore (e.g. bots), excluded from review counting.
+    pub ignored: Vec<String>,
 }
 
 impl Default for StatsOptions {
@@ -345,6 +356,7 @@ impl Default for StatsOptions {
             owners: Vec::new(),
             days: 30,
             limit: 200,
+            ignored: Vec::new(),
         }
     }
 }
@@ -366,7 +378,7 @@ pub fn collect_stats(client: &GhClient, opts: &StatsOptions) -> Result<(String, 
     let nodes = search_pull_requests(client, &parts.join(" "), opts.limit)?;
     let summaries: Vec<PullRequestSummary> = nodes
         .iter()
-        .map(|node| summarize_pull_request(node, &login, &["reviewed".to_string()]))
+        .map(|node| summarize_pull_request(node, &login, &["reviewed".to_string()], &opts.ignored))
         .collect();
 
     let mut stats = calculate_stats(&login, &summaries, since, until);
@@ -524,6 +536,7 @@ mod tests {
             &fixture_pr(),
             "bob",
             &["requested".to_string(), "reviewed".to_string()],
+            &[],
         );
 
         // bob has his own latest review (APPROVED) -> Reviewed.
@@ -539,7 +552,7 @@ mod tests {
 
     #[test]
     fn summarize_for_non_reviewer_not_requested_is_other() {
-        let summary = summarize_pull_request(&fixture_pr(), "dave", &["reviewed".to_string()]);
+        let summary = summarize_pull_request(&fixture_pr(), "dave", &["reviewed".to_string()], &[]);
         // dave neither requested nor reviewed -> Other.
         assert_eq!(summary.review_status(), ReviewStatus::Other);
         assert!(summary.my_latest_review.is_none());
@@ -565,17 +578,35 @@ mod tests {
             "updatedAt": "2026-06-02T00:00:00Z",
             "url": "https://github.com/acme/widgets/pull/7"
         });
-        let summary = summarize_pull_request(&node, "erin", &["requested".to_string()]);
+        let summary = summarize_pull_request(&node, "erin", &["requested".to_string()], &[]);
         assert_eq!(summary.review_status(), ReviewStatus::RequestedUntouched);
 
         // With someone else's review present, it becomes "others reviewed".
-        let summary2 = summarize_pull_request(&fixture_pr(), "erin", &["requested".to_string()]);
+        let summary2 = summarize_pull_request(&fixture_pr(), "erin", &["requested".to_string()], &[]);
         assert_eq!(summary2.review_status(), ReviewStatus::RequestedOthersReviewed);
     }
 
     #[test]
+    fn ignored_reviewers_are_excluded_from_status_and_others() {
+        // erin is requested; the only review is from "carol". Normally that's
+        // RequestedOthersReviewed, but ignoring carol drops it to untouched.
+        let ignored = vec!["carol".to_string()];
+        let summary =
+            summarize_pull_request(&fixture_pr(), "erin", &["requested".to_string()], &ignored);
+        // bob's reviews remain (he's not ignored), so others still has bob...
+        assert!(summary.other_latest_reviews.iter().all(|r| r.author != "carol"));
+
+        // Now ignore everyone but erin -> no other reviews -> untouched.
+        let ignored_all = vec!["bob".to_string(), "carol".to_string()];
+        let summary2 =
+            summarize_pull_request(&fixture_pr(), "erin", &["requested".to_string()], &ignored_all);
+        assert!(summary2.other_latest_reviews.is_empty());
+        assert_eq!(summary2.review_status(), ReviewStatus::RequestedUntouched);
+    }
+
+    #[test]
     fn calculate_stats_counts_reviews_in_window() {
-        let summary = summarize_pull_request(&fixture_pr(), "bob", &["reviewed".to_string()]);
+        let summary = summarize_pull_request(&fixture_pr(), "bob", &["reviewed".to_string()], &[]);
         let since = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
         let until = Utc.with_ymd_and_hms(2026, 6, 30, 0, 0, 0).unwrap();
 

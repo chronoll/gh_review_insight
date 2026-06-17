@@ -90,10 +90,13 @@ pub struct App {
     colors: HashMap<String, [u8; 3]>,
     /// PR / repo URLs to hide from the status list.
     excludes: Vec<String>,
+    /// Reviewer logins to ignore (e.g. bots) when counting reviews.
+    ignored: Vec<String>,
     /// Settings window state.
     show_settings: bool,
     new_user: String,
     new_exclude: String,
+    new_ignored: String,
 }
 
 impl App {
@@ -112,9 +115,11 @@ impl App {
             started: false,
             colors: load_colors(),
             excludes: load_excludes(),
+            ignored: load_ignored(),
             show_settings: false,
             new_user: String::new(),
             new_exclude: String::new(),
+            new_ignored: String::new(),
         }
     }
 
@@ -129,6 +134,7 @@ impl App {
         let repos = self.repos.clone();
         let owners = self.owners.clone();
         let days = self.days;
+        let ignored = self.ignored.clone();
         let ctx = ctx.clone();
 
         std::thread::spawn(move || {
@@ -143,6 +149,7 @@ impl App {
                         include_drafts: false,
                         no_reviewed: false,
                         limit: 50,
+                        ignored,
                     },
                 )
                 .map(|(login, prs)| (login, Loaded::Status(prs))),
@@ -154,6 +161,7 @@ impl App {
                         owners,
                         days,
                         limit: 200,
+                        ignored,
                     },
                 )
                 .map(|(login, stats)| (login, Loaded::Stats(stats))),
@@ -259,14 +267,14 @@ impl App {
             .column(Column::auto()) // status
             .column(Column::auto()) // PR
             .column(Column::auto()) // author
+            .column(Column::remainder().clip(true)) // title
             .column(Column::auto()) // mine
             .column(Column::auto().at_least(80.0).at_most(220.0).clip(true)) // others
             .column(Column::auto().at_least(80.0).at_most(220.0).clip(true)) // requested
             .column(Column::auto()) // updated
-            .column(Column::remainder().clip(true)) // title
             .header(20.0, |mut header| {
                 for label in [
-                    "status", "PR", "author", "mine", "others", "requested", "updated", "title",
+                    "status", "PR", "author", "title", "mine", "others", "requested", "updated",
                 ] {
                     header.col(|ui| {
                         ui.strong(label);
@@ -284,12 +292,17 @@ impl App {
                         });
                         row.col(|ui| {
                             fill_cell(ui, tint);
-                            ui.hyperlink_to(pr.pr_key(), pr.url.as_str())
+                            ui.hyperlink_to(pr_short(pr), pr.url.as_str())
                                 .on_hover_text(detail_text(pr));
                         });
                         row.col(|ui| {
                             fill_cell(ui, tint);
                             self.user_label(ui, &pr.author);
+                        });
+                        row.col(|ui| {
+                            fill_cell(ui, tint);
+                            ui.hyperlink_to(pr.title.as_str(), pr.url.as_str())
+                                .on_hover_text(detail_text(pr));
                         });
                         row.col(|ui| {
                             fill_cell(ui, tint);
@@ -309,7 +322,11 @@ impl App {
                             let text = if pr.requested_reviewers.is_empty() {
                                 "-".to_string()
                             } else {
-                                pr.requested_reviewers.join(", ")
+                                pr.requested_reviewers
+                                    .iter()
+                                    .map(|r| r.trim_start_matches('@'))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
                             };
                             ui.add(egui::Label::new(text.as_str()).truncate())
                                 .on_hover_text(text);
@@ -317,11 +334,6 @@ impl App {
                         row.col(|ui| {
                             fill_cell(ui, tint);
                             ui.label(date10(&pr.updated_at));
-                        });
-                        row.col(|ui| {
-                            fill_cell(ui, tint);
-                            ui.hyperlink_to(pr.title.as_str(), pr.url.as_str())
-                                .on_hover_text(detail_text(pr));
                         });
                     });
                 }
@@ -414,6 +426,7 @@ impl App {
         let users = self.known_users();
         let snapshot = self.colors.clone();
         let excludes_snapshot = self.excludes.clone();
+        let ignored_snapshot = self.ignored.clone();
         let mut open = self.show_settings;
         // Collected outside the closures, then applied to `self` afterwards, so
         // we never borrow `self` across nested egui closures.
@@ -421,8 +434,11 @@ impl App {
         let mut add_user: Option<String> = None;
         let mut add_exclude: Option<String> = None;
         let mut remove_exclude: Option<String> = None;
+        let mut add_ignored: Option<String> = None;
+        let mut remove_ignored: Option<String> = None;
         let new_user = &mut self.new_user;
         let new_exclude = &mut self.new_exclude;
+        let new_ignored = &mut self.new_ignored;
 
         egui::Window::new("ユーザー色設定")
             .open(&mut open)
@@ -483,6 +499,26 @@ impl App {
                         }
                     }
                 });
+
+                ui.separator();
+                ui.label("レビュー集計で無視するアカウント（bot 等。他者レビュー扱いにしない）:");
+                for user in &ignored_snapshot {
+                    ui.horizontal(|ui| {
+                        if ui.button("解除").clicked() {
+                            remove_ignored = Some(user.clone());
+                        }
+                        ui.label(user);
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(new_ignored);
+                    if ui.button("無視に追加").clicked() {
+                        let trimmed = new_ignored.trim().trim_start_matches('@');
+                        if !trimmed.is_empty() {
+                            add_ignored = Some(trimmed.to_string());
+                        }
+                    }
+                });
             });
 
         let mut changed = false;
@@ -522,6 +558,24 @@ impl App {
             self.save_excludes();
         }
 
+        let mut ignored_changed = false;
+        if let Some(user) = add_ignored {
+            if !self.ignored.iter().any(|i| i == &user) {
+                self.ignored.push(user);
+            }
+            self.new_ignored.clear();
+            ignored_changed = true;
+        }
+        if let Some(user) = remove_ignored {
+            self.ignored.retain(|i| i != &user);
+            ignored_changed = true;
+        }
+        if ignored_changed {
+            self.save_ignored();
+            // Ignoring affects how reviews are counted, so reload the data.
+            self.start_fetch(ctx);
+        }
+
         self.show_settings = open;
     }
 
@@ -554,6 +608,18 @@ impl App {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(&self.excludes) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    fn save_ignored(&self) {
+        let Some(path) = ignored_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&self.ignored) {
             let _ = std::fs::write(path, json);
         }
     }
@@ -656,8 +722,27 @@ fn load_excludes() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Where ignored reviewer logins are persisted.
+fn ignored_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".config/gh-review-insight/ignored.json"))
+}
+
+fn load_ignored() -> Vec<String> {
+    ignored_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
 fn date10(value: &str) -> String {
     value.chars().take(10).collect()
+}
+
+/// PR identifier without the organization: `owner/repo#42` -> `repo#42`.
+fn pr_short(pr: &PullRequestSummary) -> String {
+    let repo = pr.repository.rsplit('/').next().unwrap_or(&pr.repository);
+    format!("{repo}#{}", pr.number)
 }
 
 /// Paint the whole cell background (full width and height) with a faint tint.
