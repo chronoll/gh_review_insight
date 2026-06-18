@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn summarize_marks_requested_and_latest_review() {
+    fn summarize_marks_re_requested_as_waiting() {
         let summary = summarize_pull_request(
             &fixture_pr(),
             "bob",
@@ -539,8 +539,9 @@ mod tests {
             &[],
         );
 
-        // bob has his own latest review (APPROVED) -> Reviewed.
-        assert_eq!(summary.review_status(), ReviewStatus::Reviewed);
+        // bob already reviewed (APPROVED) but is still in reviewRequests, i.e.
+        // re-requested -> back to waiting, not finished.
+        assert_eq!(summary.review_status(), ReviewStatus::RequestedUntouched);
         assert_eq!(summary.my_latest_review.as_ref().unwrap().state, "APPROVED");
         assert_eq!(
             summary.requested_reviewers,
@@ -548,6 +549,16 @@ mod tests {
         );
         assert_eq!(summary.other_latest_reviews.len(), 1);
         assert_eq!(summary.other_latest_reviews[0].author, "carol");
+    }
+
+    #[test]
+    fn reviewed_without_re_request_stays_finished() {
+        // bob reviewed but is NOT in reviewRequests and not in the requested
+        // bucket -> finished stays finished.
+        let mut node = fixture_pr();
+        node["reviewRequests"]["nodes"] = serde_json::json!([]);
+        let summary = summarize_pull_request(&node, "bob", &["reviewed".to_string()], &[]);
+        assert_eq!(summary.review_status(), ReviewStatus::Reviewed);
     }
 
     #[test]

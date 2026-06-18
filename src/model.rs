@@ -57,7 +57,9 @@ impl ReviewStatus {
     /// Full sentence used for tooltips.
     pub fn description(self) -> &'static str {
         match self {
-            ReviewStatus::RequestedUntouched => "リクエストがあるが誰もレビューしていない",
+            ReviewStatus::RequestedUntouched => {
+                "リクエストがあり自分の対応が必要（誰も未レビュー、または一度レビュー後に再リクエストされた）"
+            }
             ReviewStatus::RequestedOthersReviewed => {
                 "リクエストがあり自分はレビューしていないが、誰かがレビューした"
             }
@@ -68,18 +70,23 @@ impl ReviewStatus {
 }
 
 impl PullRequestSummary {
-    /// Classify the viewer's relationship to this PR. Having reviewed it takes
-    /// precedence; otherwise a standing request is split by whether anyone else
-    /// has reviewed.
+    /// Classify the viewer's relationship to this PR.
+    ///
+    /// A standing review request takes precedence over having reviewed: GitHub
+    /// drops you from `reviewRequests` once you submit a review and only puts
+    /// you back when the author re-requests, so being requested *again* after
+    /// reviewing means you still need to act — that re-request is treated as
+    /// `waiting`, not `finished`.
     pub fn review_status(&self) -> ReviewStatus {
-        if self.my_latest_review.is_some() {
-            ReviewStatus::Reviewed
-        } else if self.requested_for_user {
-            if self.other_latest_reviews.is_empty() {
+        if self.requested_for_user {
+            // Re-requested after your own review, or nobody has reviewed yet.
+            if self.my_latest_review.is_some() || self.other_latest_reviews.is_empty() {
                 ReviewStatus::RequestedUntouched
             } else {
                 ReviewStatus::RequestedOthersReviewed
             }
+        } else if self.my_latest_review.is_some() {
+            ReviewStatus::Reviewed
         } else {
             ReviewStatus::Other
         }
