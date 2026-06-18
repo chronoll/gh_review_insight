@@ -306,12 +306,18 @@ impl App {
                         });
                         row.col(|ui| {
                             fill_cell(ui, tint);
-                            ui.label(
-                                pr.my_latest_review
-                                    .as_ref()
-                                    .map(|r| short_state(&r.state))
-                                    .unwrap_or_else(|| "-".to_string()),
-                            );
+                            match &pr.my_latest_review {
+                                Some(review) => {
+                                    let label = short_state(&review.state);
+                                    match state_color(&review.state, dark) {
+                                        Some(color) => ui.colored_label(color, label),
+                                        None => ui.label(label),
+                                    };
+                                }
+                                None => {
+                                    ui.label("-");
+                                }
+                            }
                         });
                         row.col(|ui| {
                             fill_cell(ui, tint);
@@ -365,12 +371,16 @@ impl App {
             .map(|r| format!("{}:{}", r.author, short_state(&r.state)))
             .collect::<Vec<_>>()
             .join(", ");
+        let dark = ui.visuals().dark_mode;
         let response = ui
             .horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 for review in &pr.other_latest_reviews {
                     let text = format!("{}:{}", review.author, short_state(&review.state));
-                    match self.user_color(&review.author) {
+                    // approved -> green; otherwise fall back to the user color.
+                    let color = state_color(&review.state, dark)
+                        .or_else(|| self.user_color(&review.author));
+                    match color {
                         Some(color) => ui.colored_label(color, text),
                         None => ui.label(text),
                     };
@@ -748,6 +758,20 @@ fn pr_short(pr: &PullRequestSummary) -> String {
     format!("{repo}#{}", pr.number)
 }
 
+/// Highlight color for a review state worth calling out. APPROVED -> green
+/// (tuned per theme); everything else has no special color.
+fn state_color(state: &str, dark: bool) -> Option<egui::Color32> {
+    if state == "APPROVED" {
+        Some(if dark {
+            egui::Color32::from_rgb(120, 205, 130)
+        } else {
+            egui::Color32::from_rgb(30, 140, 60)
+        })
+    } else {
+        None
+    }
+}
+
 /// Paint the whole cell background (full width and height) with a faint tint.
 fn fill_cell(ui: &egui::Ui, tint: Option<egui::Color32>) {
     if let Some(color) = tint {
@@ -832,6 +856,14 @@ mod tests {
         for ch in ['あ', 'ア', '漢', 'レ'] {
             assert_ne!(font.glyph_id(ch).0, 0, "'{ch}' のグリフがありません");
         }
+    }
+
+    #[test]
+    fn approved_state_gets_a_color_others_do_not() {
+        assert!(super::state_color("APPROVED", true).is_some());
+        assert!(super::state_color("APPROVED", false).is_some());
+        assert!(super::state_color("COMMENTED", true).is_none());
+        assert!(super::state_color("CHANGES_REQUESTED", false).is_none());
     }
 
     #[test]
