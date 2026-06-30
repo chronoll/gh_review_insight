@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use crate::config::{colors_path, excludes_path, ignored_path, load_colors, load_excludes, load_ignored};
+
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
@@ -707,45 +709,6 @@ impl eframe::App for App {
 
         self.settings_window(ctx);
     }
-}
-
-/// Where per-user colors are persisted: `$HOME/.config/gh-review-insight/colors.json`.
-fn colors_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(std::path::PathBuf::from(home).join(".config/gh-review-insight/colors.json"))
-}
-
-fn load_colors() -> HashMap<String, [u8; 3]> {
-    colors_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
-}
-
-/// Where excluded URLs are persisted: `$HOME/.config/gh-review-insight/excludes.json`.
-fn excludes_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(std::path::PathBuf::from(home).join(".config/gh-review-insight/excludes.json"))
-}
-
-fn load_excludes() -> Vec<String> {
-    excludes_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
-}
-
-/// Where ignored reviewer logins are persisted.
-fn ignored_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(std::path::PathBuf::from(home).join(".config/gh-review-insight/ignored.json"))
-}
-
-fn load_ignored() -> Vec<String> {
-    ignored_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
 }
 
 fn date10(value: &str) -> String {

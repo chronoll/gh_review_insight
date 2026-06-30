@@ -35,6 +35,22 @@ cargo build --release      # target/release/gh-review-insight
 cargo install --path .     # PATH に gh-review-insight を入れる
 ```
 
+## macOS アプリとして常駐させる
+
+リリースビルドから `.app` を作り、Dock / Spotlight から起動したり、ログイン時に自動起動できます。
+
+```bash
+./scripts/bundle-macos.sh            # .app を生成（target/release/macos/ に出力）
+./scripts/bundle-macos.sh --install  # /Applications にインストール
+./scripts/bundle-macos.sh --login    # インストール + ログイン項目に登録（ログイン時に自動起動）
+```
+
+- 生成された `.app` は Dock / Launchpad / Spotlight から起動できます。
+- ログイン項目は システム設定 > 一般 > ログイン項目 で確認・解除できます。
+- ad-hoc 署名のため、初回起動時に「開発元を確認できません」と出た場合は `.app` を右クリック →「開く」で許可してください。
+- GUI 起動（Dock など）では `PATH` が最小限になり `gh` が見つからないことがありますが、`/opt/homebrew/bin` などを自動探索するようにしてあります。
+- アイコンを付けたい場合は `assets/icon.icns` を置いてから再ビルドしてください。
+
 ## 画面と操作
 
 - ツールバーの `status` / `stats` でビュー切替、`⟳ 更新` で再取得、`⚙ 設定` で色設定を開閉。
