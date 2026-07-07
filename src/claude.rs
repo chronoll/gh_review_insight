@@ -1,0 +1,371 @@
+//! Claude Code CLI integration. Runs the `gh-review:review` skill headlessly
+//! (`claude -p`) for a single pull request, saves the resulting report under
+//! the app's workspace directory, and keeps the session id so the
+//! conversation can be resumed later in a terminal.
+
+use anyhow::{Context, Result, anyhow};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use crate::config;
+
+/// Locations commonly holding the `claude` binary. Home-relative entries are
+/// expanded at runtime; a GUI launch (Dock / Spotlight) has a minimal PATH.
+fn claude_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        for rel in [".local/bin/claude", ".claude/local/claude"] {
+            candidates.push(home.join(rel).to_string_lossy().into_owned());
+        }
+    }
+    candidates.push("/opt/homebrew/bin/claude".to_string());
+    candidates.push("/usr/local/bin/claude".to_string());
+    candidates
+}
+
+/// Resolve the `claude` binary, mirroring how `gh.rs` resolves `gh`.
+fn resolve_claude(preferred: &str) -> String {
+    resolve_claude_in(preferred, &claude_candidates())
+}
+
+fn resolve_claude_in(preferred: &str, candidates: &[String]) -> String {
+    if preferred.contains('/') && Path::new(preferred).exists() {
+        return preferred.to_string();
+    }
+    for candidate in candidates {
+        if Path::new(candidate).exists() {
+            return candidate.clone();
+        }
+    }
+    preferred.to_string()
+}
+
+/// PATH augmented with the common bin dirs, for tools `claude` itself spawns
+/// (`gh` など). Needed because a `.app` launch inherits a minimal PATH.
+fn augmented_path() -> String {
+    let mut dirs: Vec<String> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        for rel in [".local/bin", ".claude/local"] {
+            dirs.push(home.join(rel).to_string_lossy().into_owned());
+        }
+    }
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+        dirs.push(dir.to_string());
+    }
+    let existing = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{existing}", dirs.join(":"))
+}
+
+/// Tools pre-approved for the headless review run. `-p` mode cannot answer
+/// permission prompts (anything not allowed is auto-denied), so everything
+/// the review skill and its subagents use must be listed here. Matches the
+/// gh-review skill's `allowed-tools` plus the orchestration tools.
+const REVIEW_ALLOWED_TOOLS: &str = "Bash,Glob,Grep,Read,Agent,Task,TodoWrite,Skill";
+
+/// A finished headless review: the session to resume and the saved report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiSessionRecord {
+    pub session_id: String,
+    /// RFC3339 timestamp of when the run finished.
+    pub completed_at: String,
+    /// Absolute path of the saved report, if the run produced text.
+    pub report_path: Option<String>,
+}
+
+impl AiSessionRecord {
+    fn to_value(&self) -> Value {
+        serde_json::json!({
+            "session_id": self.session_id,
+            "completed_at": self.completed_at,
+            "report_path": self.report_path,
+        })
+    }
+
+    fn from_value(value: &Value) -> Option<Self> {
+        let session_id = value["session_id"].as_str()?.to_string();
+        if session_id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            session_id,
+            completed_at: value["completed_at"].as_str().unwrap_or("").to_string(),
+            report_path: value["report_path"].as_str().map(str::to_string),
+        })
+    }
+}
+
+/// Load persisted review sessions, keyed by PR URL.
+pub fn load_sessions() -> HashMap<String, AiSessionRecord> {
+    let Some(path) = config::ai_sessions_path() else {
+        return HashMap::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return HashMap::new();
+    };
+    let Some(map) = value.as_object() else {
+        return HashMap::new();
+    };
+    map.iter()
+        .filter_map(|(url, v)| AiSessionRecord::from_value(v).map(|r| (url.clone(), r)))
+        .collect()
+}
+
+/// Persist review sessions, keyed by PR URL.
+pub fn save_sessions(sessions: &HashMap<String, AiSessionRecord>) {
+    let Some(path) = config::ai_sessions_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let map: serde_json::Map<String, Value> = sessions
+        .iter()
+        .map(|(url, record)| (url.clone(), record.to_value()))
+        .collect();
+    if let Ok(json) = serde_json::to_string_pretty(&Value::Object(map)) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Open the saved review report with the default application.
+pub fn open_report(path: &str) -> Result<()> {
+    Command::new("open")
+        .arg(path)
+        .spawn()
+        .context("レビュー結果を開けませんでした")?;
+    Ok(())
+}
+
+/// Thin wrapper around the `claude` CLI.
+pub struct ClaudeClient {
+    pub claude_path: String,
+}
+
+impl ClaudeClient {
+    pub fn new(claude_path: impl Into<String>) -> Self {
+        Self {
+            claude_path: claude_path.into(),
+        }
+    }
+
+    /// Run `/gh-review:review <pr_url>` headlessly. Blocks until the review
+    /// finishes (minutes), so call this from a background thread. The final
+    /// report text is saved as `<workspace>/reviews/<pr_key>.md`.
+    pub fn run_review(&self, pr_url: &str, pr_key: &str) -> Result<AiSessionRecord> {
+        let workspace = workspace_dir()?;
+        let reviews_dir = workspace.join("reviews");
+        std::fs::create_dir_all(&reviews_dir)
+            .context("reviews ディレクトリを作成できませんでした")?;
+
+        let mut cmd = Command::new(resolve_claude(&self.claude_path));
+        cmd.env("PATH", augmented_path());
+        cmd.current_dir(&workspace);
+        cmd.arg("-p")
+            .arg(format!("/gh-review:review {pr_url}"))
+            .arg("--output-format")
+            .arg("json")
+            .arg("--allowedTools")
+            .arg(REVIEW_ALLOWED_TOOLS);
+
+        let output = cmd.output().map_err(|err| {
+            anyhow!("Claude Code CLI `claude` を実行できませんでした: {err}")
+        })?;
+
+        let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let trimmed = stderr.trim();
+            return Err(anyhow!(if trimmed.is_empty() {
+                "`claude` がJSON応答を返しませんでした。".to_string()
+            } else {
+                trimmed.to_string()
+            }));
+        };
+        let (session_id, report) = parse_run_output(&value)?;
+
+        let report_path = if report.trim().is_empty() {
+            None
+        } else {
+            let path = reviews_dir.join(format!("{}.md", sanitize_file_stem(pr_key)));
+            std::fs::write(&path, &report).context("レビュー結果を保存できませんでした")?;
+            Some(path.to_string_lossy().into_owned())
+        };
+
+        Ok(AiSessionRecord {
+            session_id,
+            completed_at: chrono::Utc::now().to_rfc3339(),
+            report_path,
+        })
+    }
+
+    /// Open Terminal.app and resume the review session interactively. The
+    /// shell cd's into the workspace first because Claude Code looks up
+    /// sessions per project directory.
+    pub fn open_resume_terminal(&self, session_id: &str) -> Result<()> {
+        let workspace = workspace_dir()?;
+        let shell = format!(
+            "cd {} && {} --resume {}",
+            sh_quote(&workspace.to_string_lossy()),
+            sh_quote(&resolve_claude(&self.claude_path)),
+            sh_quote(session_id),
+        );
+        let script = format!(
+            "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
+            applescript_escape(&shell),
+        );
+        Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .spawn()
+            .context("Terminal を開けませんでした")?;
+        Ok(())
+    }
+}
+
+fn workspace_dir() -> Result<PathBuf> {
+    config::workspace_dir()
+        .ok_or_else(|| anyhow!("HOME が取得できず作業ディレクトリを決められませんでした。"))
+}
+
+/// Extract `(session_id, result_text)` from a `claude -p --output-format json`
+/// response. An `is_error` response surfaces its message as the error.
+fn parse_run_output(value: &Value) -> Result<(String, String)> {
+    if value["is_error"].as_bool().unwrap_or(false) {
+        let message = match value["result"].as_str() {
+            Some(text) if !text.trim().is_empty() => text.to_string(),
+            _ => format!(
+                "claude の実行がエラーになりました（subtype: {}）",
+                value["subtype"].as_str().unwrap_or("unknown"),
+            ),
+        };
+        return Err(anyhow!(message));
+    }
+    let session_id = value["session_id"].as_str().unwrap_or("").to_string();
+    if session_id.is_empty() {
+        return Err(anyhow!("claude の応答から session_id を取得できませんでした。"));
+    }
+    Ok((session_id, value["result"].as_str().unwrap_or("").to_string()))
+}
+
+/// `owner/repo#42` -> `owner-repo-42` (filesystem-safe stem).
+fn sanitize_file_stem(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Quote a string for /bin/sh (single quotes, embedded quotes escaped).
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Escape a string for embedding in a double-quoted AppleScript literal.
+fn applescript_escape(value: &str) -> String {
+    value.replace('\\', r"\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_run_output_extracts_session_and_result() {
+        let value = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "# レビュー結果\n指摘は3件です。",
+            "session_id": "abc-123",
+        });
+        let (session_id, report) = parse_run_output(&value).unwrap();
+        assert_eq!(session_id, "abc-123");
+        assert!(report.starts_with("# レビュー結果"));
+    }
+
+    #[test]
+    fn parse_run_output_surfaces_error_responses() {
+        let value = json!({
+            "is_error": true,
+            "subtype": "error_during_execution",
+            "result": "boom",
+            "session_id": "abc",
+        });
+        let err = parse_run_output(&value).unwrap_err();
+        assert!(err.to_string().contains("boom"));
+
+        // Error without a message falls back to the subtype.
+        let value = json!({"is_error": true, "subtype": "error_max_turns"});
+        let err = parse_run_output(&value).unwrap_err();
+        assert!(err.to_string().contains("error_max_turns"));
+
+        // A success shape without a session id is still an error.
+        let value = json!({"is_error": false, "result": "ok"});
+        assert!(parse_run_output(&value).is_err());
+    }
+
+    #[test]
+    fn session_record_roundtrips_through_json() {
+        let record = AiSessionRecord {
+            session_id: "s-1".to_string(),
+            completed_at: "2026-07-08T00:00:00+00:00".to_string(),
+            report_path: Some("/tmp/r.md".to_string()),
+        };
+        assert_eq!(AiSessionRecord::from_value(&record.to_value()), Some(record));
+
+        let no_report = AiSessionRecord {
+            session_id: "s-2".to_string(),
+            completed_at: "2026-07-08T00:00:00+00:00".to_string(),
+            report_path: None,
+        };
+        assert_eq!(
+            AiSessionRecord::from_value(&no_report.to_value()),
+            Some(no_report)
+        );
+
+        // Records without a session id are dropped.
+        assert_eq!(AiSessionRecord::from_value(&json!({"report_path": "x"})), None);
+    }
+
+    #[test]
+    fn pr_key_becomes_a_safe_file_stem() {
+        assert_eq!(
+            sanitize_file_stem("everytv/delish-web2#4501"),
+            "everytv-delish-web2-4501"
+        );
+    }
+
+    #[test]
+    fn shell_and_applescript_quoting() {
+        assert_eq!(sh_quote("a b"), "'a b'");
+        assert_eq!(sh_quote("it's"), r"'it'\''s'");
+        assert_eq!(applescript_escape(r#"say "hi" \o/"#), r#"say \"hi\" \\o/"#);
+    }
+
+    #[test]
+    fn resolve_prefers_explicit_path_then_candidates() {
+        let exe = std::env::current_exe().unwrap();
+        let path = exe.to_string_lossy().to_string();
+        assert_eq!(
+            resolve_claude_in(&path, &["/nonexistent/claude".to_string()]),
+            path
+        );
+        assert_eq!(resolve_claude_in("claude", &[path.clone()]), path);
+        assert_eq!(
+            resolve_claude_in("claude", &["/nope/claude".to_string()]),
+            "claude"
+        );
+    }
+}

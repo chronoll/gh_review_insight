@@ -1,4 +1,5 @@
 mod app;
+mod claude;
 mod config;
 mod core;
 mod gh;

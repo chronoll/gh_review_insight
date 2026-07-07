@@ -20,6 +20,18 @@ pub fn ignored_path() -> Option<PathBuf> {
     Some(config_dir()?.join("ignored.json"))
 }
 
+/// Completed AI review sessions, keyed by PR URL.
+pub fn ai_sessions_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("ai_sessions.json"))
+}
+
+/// Working directory for headless `claude` runs. Review reports are saved
+/// under `<dir>/reviews/`, and sessions are resumed from this directory
+/// (Claude Code looks up sessions per project directory).
+pub fn workspace_dir() -> Option<PathBuf> {
+    Some(config_dir()?.join("workspace"))
+}
+
 pub fn load_colors() -> HashMap<String, [u8; 3]> {
     colors_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
