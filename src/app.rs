@@ -2,16 +2,19 @@
 //!
 //! Two views, toggled in the toolbar:
 //! - **status**: a table of pull requests. Clicking a PR (its id or title)
-//!   opens the GitHub page in the browser.
+//!   opens the GitHub page in the browser. Rows can be checked and reviewed
+//!   in bulk by Claude Code (headless `claude -p`); finished reviews expose
+//!   the saved report and a Terminal hand-off to resume the session.
 //! - **stats**: aggregated review activity for the last N days.
 //!
-//! Fetching runs on a background thread and the result is delivered over a
-//! channel, so the gh subprocess never blocks the UI thread.
+//! Fetching and AI review runs happen on background threads and results are
+//! delivered over channels, so subprocesses never block the UI thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use crate::claude::{self, AiSessionRecord, ClaudeClient};
 use crate::config::{colors_path, excludes_path, ignored_path, load_colors, load_excludes, load_ignored};
 
 use eframe::egui;
@@ -76,6 +79,28 @@ enum ViewState {
     Error(String),
 }
 
+/// Lifecycle of the Claude review for one PR (absent = not started).
+enum AiReview {
+    Running,
+    Done(AiSessionRecord),
+    Failed(String),
+}
+
+/// `(PR URL, outcome)` delivered from a review thread.
+type AiResult = (String, Result<AiSessionRecord, String>);
+
+/// Row interactions collected while drawing the table (which only has `&self`)
+/// and applied to `self` afterwards.
+#[derive(Default)]
+struct TableActions {
+    /// PR URLs whose selection checkbox was toggled.
+    toggle: Vec<String>,
+    /// Report file to open.
+    open_report: Option<String>,
+    /// Session id to resume in Terminal.
+    resume: Option<String>,
+}
+
 pub struct App {
     gh_path: String,
     user: String,
@@ -99,10 +124,23 @@ pub struct App {
     new_user: String,
     new_exclude: String,
     new_ignored: String,
+    /// `claude` binary (resolved like `gh`; see claude.rs).
+    claude_path: String,
+    /// PR URLs checked for a batch AI review.
+    selected: HashSet<String>,
+    /// AI review state per PR URL. Persisted `Done` entries survive restarts.
+    ai: HashMap<String, AiReview>,
+    ai_tx: Sender<AiResult>,
+    ai_rx: Receiver<AiResult>,
 }
 
 impl App {
     pub fn new(gh_path: String) -> Self {
+        let (ai_tx, ai_rx) = channel();
+        let ai = claude::load_sessions()
+            .into_iter()
+            .map(|(url, record)| (url, AiReview::Done(record)))
+            .collect();
         Self {
             gh_path,
             user: "@me".to_string(),
@@ -122,6 +160,11 @@ impl App {
             new_user: String::new(),
             new_exclude: String::new(),
             new_ignored: String::new(),
+            claude_path: "claude".to_string(),
+            selected: HashSet::new(),
+            ai,
+            ai_tx,
+            ai_rx,
         }
     }
 
@@ -190,6 +233,106 @@ impl App {
         }
     }
 
+    /// Drain finished AI review jobs and persist newly completed sessions.
+    fn poll_ai(&mut self) {
+        let mut finished = false;
+        while let Ok((url, result)) = self.ai_rx.try_recv() {
+            match result {
+                Ok(record) => {
+                    self.ai.insert(url, AiReview::Done(record));
+                    finished = true;
+                }
+                Err(message) => {
+                    self.ai.insert(url, AiReview::Failed(message));
+                }
+            }
+        }
+        if finished {
+            self.save_ai_sessions();
+        }
+    }
+
+    fn save_ai_sessions(&self) {
+        let sessions: HashMap<String, AiSessionRecord> = self
+            .ai
+            .iter()
+            .filter_map(|(url, state)| match state {
+                AiReview::Done(record) => Some((url.clone(), record.clone())),
+                _ => None,
+            })
+            .collect();
+        claude::save_sessions(&sessions);
+    }
+
+    /// Check every actionable (waiting / should) visible PR.
+    fn select_actionable(&mut self) {
+        let ViewState::Ready(Loaded::Status(prs)) = &self.state else {
+            return;
+        };
+        let urls: Vec<String> = prs
+            .iter()
+            .filter(|pr| !self.is_excluded(&pr.url))
+            .filter(|pr| {
+                matches!(
+                    pr.review_status(),
+                    ReviewStatus::RequestedUntouched | ReviewStatus::RequestedOthersReviewed
+                )
+            })
+            .filter(|pr| !matches!(self.ai.get(&pr.url), Some(AiReview::Running)))
+            .map(|pr| pr.url.clone())
+            .collect();
+        self.selected.extend(urls);
+    }
+
+    /// Kick off one headless review thread per selected PR.
+    fn start_ai_reviews(&mut self, ctx: &egui::Context) {
+        let ViewState::Ready(Loaded::Status(prs)) = &self.state else {
+            return;
+        };
+        let targets: Vec<(String, String)> = prs
+            .iter()
+            .filter(|pr| self.selected.contains(&pr.url))
+            .filter(|pr| !matches!(self.ai.get(&pr.url), Some(AiReview::Running)))
+            .map(|pr| (pr.url.clone(), pr.pr_key()))
+            .collect();
+
+        for (url, pr_key) in targets {
+            self.selected.remove(&url);
+            self.ai.insert(url.clone(), AiReview::Running);
+
+            let tx = self.ai_tx.clone();
+            let ctx = ctx.clone();
+            let claude_path = self.claude_path.clone();
+            std::thread::spawn(move || {
+                let client = ClaudeClient::new(claude_path);
+                let result = client
+                    .run_review(&url, &pr_key)
+                    .map_err(|err| format!("{err:#}"));
+                let _ = tx.send((url, result));
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    fn apply_table_actions(&mut self, actions: TableActions) {
+        for url in actions.toggle {
+            if !self.selected.remove(&url) {
+                self.selected.insert(url);
+            }
+        }
+        if let Some(path) = actions.open_report {
+            if let Err(err) = claude::open_report(&path) {
+                eprintln!("warning: {err:#}");
+            }
+        }
+        if let Some(session_id) = actions.resume {
+            let client = ClaudeClient::new(self.claude_path.clone());
+            if let Err(err) = client.open_resume_terminal(&session_id) {
+                eprintln!("warning: {err:#}");
+            }
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.heading("gh-review-insight");
@@ -216,6 +359,28 @@ impl App {
                             .hint_text("title / repo / author")
                             .desired_width(220.0),
                     );
+                    ui.separator();
+                    if ui
+                        .button("未対応を選択")
+                        .on_hover_text("waiting / should の PR をまとめて選択")
+                        .clicked()
+                    {
+                        self.select_actionable();
+                    }
+                    let count = self.selected.len();
+                    if ui
+                        .add_enabled(
+                            count > 0,
+                            egui::Button::new(format!("AIレビュー実行 ({count})")),
+                        )
+                        .on_hover_text("選択した PR ごとに claude のレビュースキルを実行")
+                        .clicked()
+                    {
+                        self.start_ai_reviews(ctx);
+                    }
+                    if count > 0 && ui.button("解除").clicked() {
+                        self.selected.clear();
+                    }
                 }
                 Mode::Stats => {
                     ui.label("days:");
@@ -243,7 +408,7 @@ impl App {
         });
     }
 
-    fn table(&self, ui: &mut egui::Ui, prs: &[PullRequestSummary]) {
+    fn table(&self, ui: &mut egui::Ui, prs: &[PullRequestSummary], actions: &mut TableActions) {
         let needle = self.filter.to_lowercase();
         let rows: Vec<&PullRequestSummary> = prs
             .iter()
@@ -266,6 +431,7 @@ impl App {
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
+            .column(Column::auto()) // select
             .column(Column::auto()) // status
             .column(Column::auto()) // PR
             .column(Column::auto()) // author
@@ -274,9 +440,11 @@ impl App {
             .column(Column::auto().at_least(80.0).at_most(220.0).clip(true)) // others
             .column(Column::auto().at_least(80.0).at_most(220.0).clip(true)) // requested
             .column(Column::auto()) // updated
+            .column(Column::auto()) // AI
             .header(20.0, |mut header| {
                 for label in [
-                    "status", "PR", "author", "title", "mine", "others", "requested", "updated",
+                    "", "status", "PR", "author", "title", "mine", "others", "requested",
+                    "updated", "AI",
                 ] {
                     header.col(|ui| {
                         ui.strong(label);
@@ -287,6 +455,13 @@ impl App {
                 for pr in &rows {
                     let tint = status_tint(pr.review_status(), dark);
                     body.row(24.0, |mut row| {
+                        row.col(|ui| {
+                            fill_cell(ui, tint);
+                            let mut checked = self.selected.contains(&pr.url);
+                            if ui.checkbox(&mut checked, "").changed() {
+                                actions.toggle.push(pr.url.clone());
+                            }
+                        });
                         row.col(|ui| {
                             fill_cell(ui, tint);
                             ui.label(pr.review_status().label())
@@ -343,9 +518,55 @@ impl App {
                             fill_cell(ui, tint);
                             ui.label(date10(&pr.updated_at));
                         });
+                        row.col(|ui| {
+                            fill_cell(ui, tint);
+                            self.ai_cell(ui, pr, actions);
+                        });
                     });
                 }
             });
+    }
+
+    /// The "AI" column: current review state, with the report / resume
+    /// hand-off once a review has finished.
+    fn ai_cell(&self, ui: &mut egui::Ui, pr: &PullRequestSummary, actions: &mut TableActions) {
+        match self.ai.get(&pr.url) {
+            None => {
+                ui.label("-");
+            }
+            Some(AiReview::Running) => {
+                ui.add(egui::Spinner::new().size(14.0))
+                    .on_hover_text("AIレビューを実行中…");
+            }
+            Some(AiReview::Done(record)) => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if let Some(path) = &record.report_path {
+                        if ui
+                            .small_button("結果")
+                            .on_hover_text("保存済みのレビューレポートを開く")
+                            .clicked()
+                        {
+                            actions.open_report = Some(path.clone());
+                        }
+                    }
+                    if ui
+                        .small_button("続き")
+                        .on_hover_text(format!(
+                            "ターミナルでこのレビューの会話を再開（実行日: {}）",
+                            date10(&record.completed_at),
+                        ))
+                        .clicked()
+                    {
+                        actions.resume = Some(record.session_id.clone());
+                    }
+                });
+            }
+            Some(AiReview::Failed(message)) => {
+                ui.colored_label(egui::Color32::RED, "失敗")
+                    .on_hover_text(format!("{message}\n（再選択して実行し直せます）"));
+            }
+        }
     }
 
     /// A user name, colored if the user has a custom color assigned.
@@ -690,11 +911,13 @@ impl eframe::App for App {
             self.start_fetch(ctx);
         }
         self.poll();
+        self.poll_ai();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             self.toolbar(ui, ctx);
         });
 
+        let mut actions = TableActions::default();
         egui::CentralPanel::default().show(ctx, |ui| match &self.state {
             ViewState::Loading => {
                 ui.label("取得しています…");
@@ -703,9 +926,15 @@ impl eframe::App for App {
                 ui.colored_label(egui::Color32::RED, message);
                 ui.label("`gh` が認証済みか（`gh auth status`）確認してください。");
             }
-            ViewState::Ready(Loaded::Status(prs)) => self.table(ui, prs),
+            ViewState::Ready(Loaded::Status(prs)) => self.table(ui, prs, &mut actions),
             ViewState::Ready(Loaded::Stats(stats)) => self.stats_view(ui, stats),
         });
+        self.apply_table_actions(actions);
+
+        // Keep spinners animating and pick up finished jobs promptly.
+        if self.ai.values().any(|state| matches!(state, AiReview::Running)) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
 
         self.settings_window(ctx);
     }
