@@ -1,7 +1,9 @@
-//! Claude Code CLI integration. Runs the `gh-review:review` skill headlessly
-//! (`claude -p`) for a single pull request, saves the resulting report under
-//! the app's workspace directory, and keeps the session id so the
-//! conversation can be resumed later in a terminal.
+//! Claude Code CLI integration.
+//!
+//! The GUI launches one interactive `claude` per pull request inside a shared
+//! tmux session, so each run is visible (and continuable) exactly like normal
+//! terminal usage. A headless variant (`claude -p`, JSON output, saved report)
+//! is kept below for a possible future switch back.
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
@@ -66,6 +68,62 @@ fn augmented_path() -> String {
 /// gh-review skill's `allowed-tools` plus the orchestration tools.
 const REVIEW_ALLOWED_TOOLS: &str = "Bash,Glob,Grep,Read,Agent,Task,TodoWrite,Skill";
 
+/// tmux session that hosts the interactive review runs (one pane per PR).
+const TMUX_SESSION: &str = "gh-review";
+
+/// The prompt sent to `claude` for one PR.
+///
+/// 検証モード: 本来は `/gh-review:review <URL>` を送るが、レビュースキルは
+/// subagent を大量に起動しトークン消費が激しい（複数 PR 同時実行でレート
+/// リミットに達した実績あり）ため、呼び出し経路の検証が済むまで即答する
+/// 軽量プロンプトに差し替えている。戻すときは下の行を入れ替える。
+fn review_prompt(pr_url: &str) -> String {
+    format!("接続テストです。ツールを使わず「{pr_url} のレビュー依頼を受け付けました」とだけ一行で返答してください。")
+    // 本来: format!("/gh-review:review {pr_url}")
+}
+
+/// Locations commonly holding `tmux` (Homebrew installs are missing from the
+/// minimal PATH a GUI launch inherits).
+fn tmux_candidates() -> Vec<String> {
+    ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn resolve_tmux() -> String {
+    resolve_claude_in("tmux", &tmux_candidates())
+}
+
+/// Run a tmux command, returning stdout on success.
+fn tmux_run(tmux: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(tmux)
+        .env("PATH", augmented_path())
+        .args(args)
+        .output()
+        .map_err(|err| {
+            anyhow!("tmux を実行できませんでした（`brew install tmux` が必要です）: {err}")
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "tmux {} が失敗しました: {}",
+            args.first().unwrap_or(&""),
+            stderr.trim(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn tmux_has_session(tmux: &str) -> bool {
+    Command::new(tmux)
+        .env("PATH", augmented_path())
+        .args(["has-session", "-t", TMUX_SESSION])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 /// A finished headless review: the session to resume and the saved report.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AiSessionRecord {
@@ -117,7 +175,9 @@ pub fn load_sessions() -> HashMap<String, AiSessionRecord> {
         .collect()
 }
 
-/// Persist review sessions, keyed by PR URL.
+/// Persist review sessions, keyed by PR URL. Only the headless flow produces
+/// new records; kept alongside `run_review` for a possible switch back.
+#[allow(dead_code)]
 pub fn save_sessions(sessions: &HashMap<String, AiSessionRecord>) {
     let Some(path) = config::ai_sessions_path() else {
         return;
@@ -155,9 +215,86 @@ impl ClaudeClient {
         }
     }
 
-    /// Run `/gh-review:review <pr_url>` headlessly. Blocks until the review
-    /// finishes (minutes), so call this from a background thread. The final
-    /// report text is saved as `<workspace>/reviews/<pr_key>.md`.
+    /// Start an interactive `claude` for one PR inside the shared tmux
+    /// session (created on first use), so the run is visible and continuable
+    /// like normal terminal usage. Returns quickly; the review itself keeps
+    /// running in its pane.
+    pub fn launch_review_in_tmux(&self, pr_url: &str, pr_key: &str) -> Result<()> {
+        let workspace = workspace_dir()?;
+        std::fs::create_dir_all(&workspace)
+            .context("workspace ディレクトリを作成できませんでした")?;
+        let cwd = workspace.to_string_lossy().into_owned();
+        let tmux = resolve_tmux();
+        let command = format!(
+            "{} {}",
+            sh_quote(&resolve_claude(&self.claude_path)),
+            sh_quote(&review_prompt(pr_url)),
+        );
+
+        let pane_id = if tmux_has_session(&tmux) {
+            // Add a pane to the existing window; fall back to a new window
+            // when the layout has no room left.
+            let target = format!("{TMUX_SESSION}:");
+            let split = tmux_run(
+                &tmux,
+                &["split-window", "-d", "-P", "-F", "#{pane_id}", "-t", &target, "-c", &cwd, &command],
+            );
+            match split {
+                Ok(pane_id) => {
+                    tmux_run(&tmux, &["select-layout", "-t", &target, "tiled"])?;
+                    pane_id
+                }
+                Err(_) => tmux_run(
+                    &tmux,
+                    &["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", &target, "-c", &cwd, &command],
+                )?,
+            }
+        } else {
+            tmux_run(
+                &tmux,
+                &["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", TMUX_SESSION, "-c", &cwd, &command],
+            )?
+        };
+
+        let pane_id = pane_id.trim().to_string();
+        if !pane_id.is_empty() {
+            // Show the PR key on the pane border, and keep claude's own
+            // title updates from overwriting it (allow-set-title off).
+            let _ = tmux_run(&tmux, &["set-option", "-w", "-t", &pane_id, "pane-border-status", "top"]);
+            let _ = tmux_run(&tmux, &["set-option", "-w", "-t", &pane_id, "allow-set-title", "off"]);
+            let _ = tmux_run(&tmux, &["select-pane", "-t", &pane_id, "-T", pr_key]);
+        }
+        Ok(())
+    }
+
+    /// Open Terminal.app attached to the review tmux session. With
+    /// `only_if_detached`, does nothing when a client is already attached
+    /// (used right after launching, to avoid piling up windows).
+    pub fn open_tmux_terminal(&self, only_if_detached: bool) -> Result<()> {
+        let tmux = resolve_tmux();
+        if !tmux_has_session(&tmux) {
+            return Err(anyhow!("tmux セッション {TMUX_SESSION} がありません。"));
+        }
+        if only_if_detached {
+            let clients = tmux_run(&tmux, &["list-clients", "-t", TMUX_SESSION])?;
+            if !clients.trim().is_empty() {
+                return Ok(());
+            }
+        }
+        open_in_terminal(&format!(
+            "{} attach -t {}",
+            sh_quote(&tmux),
+            sh_quote(TMUX_SESSION),
+        ))
+    }
+
+    /// Run the review headlessly (`claude -p`, JSON output). Blocks until the
+    /// review finishes (minutes), so call this from a background thread. The
+    /// final report text is saved as `<workspace>/reviews/<pr_key>.md`.
+    ///
+    /// 現在の GUI は tmux での対話実行を使うため未使用だが、完了検知・
+    /// レポート保存・セッション永続化ができる実装として保持している。
+    #[allow(dead_code)]
     pub fn run_review(&self, pr_url: &str, pr_key: &str) -> Result<AiSessionRecord> {
         let workspace = workspace_dir()?;
         let reviews_dir = workspace.join("reviews");
@@ -168,7 +305,7 @@ impl ClaudeClient {
         cmd.env("PATH", augmented_path());
         cmd.current_dir(&workspace);
         cmd.arg("-p")
-            .arg(format!("/gh-review:review {pr_url}"))
+            .arg(review_prompt(pr_url))
             .arg("--output-format")
             .arg("json")
             .arg("--allowedTools")
@@ -209,23 +346,27 @@ impl ClaudeClient {
     /// sessions per project directory.
     pub fn open_resume_terminal(&self, session_id: &str) -> Result<()> {
         let workspace = workspace_dir()?;
-        let shell = format!(
+        open_in_terminal(&format!(
             "cd {} && {} --resume {}",
             sh_quote(&workspace.to_string_lossy()),
             sh_quote(&resolve_claude(&self.claude_path)),
             sh_quote(session_id),
-        );
-        let script = format!(
-            "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
-            applescript_escape(&shell),
-        );
-        Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .spawn()
-            .context("Terminal を開けませんでした")?;
-        Ok(())
+        ))
     }
+}
+
+/// Open Terminal.app and run a shell command in a new window.
+fn open_in_terminal(shell: &str) -> Result<()> {
+    let script = format!(
+        "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
+        applescript_escape(shell),
+    );
+    Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .spawn()
+        .context("Terminal を開けませんでした")?;
+    Ok(())
 }
 
 fn workspace_dir() -> Result<PathBuf> {
@@ -337,6 +478,12 @@ mod tests {
 
         // Records without a session id are dropped.
         assert_eq!(AiSessionRecord::from_value(&json!({"report_path": "x"})), None);
+    }
+
+    #[test]
+    fn review_prompt_embeds_the_pr_url() {
+        let prompt = review_prompt("https://github.com/acme/widgets/pull/42");
+        assert!(prompt.contains("https://github.com/acme/widgets/pull/42"));
     }
 
     #[test]

@@ -3,12 +3,13 @@
 //! Two views, toggled in the toolbar:
 //! - **status**: a table of pull requests. Clicking a PR (its id or title)
 //!   opens the GitHub page in the browser. Rows can be checked and reviewed
-//!   in bulk by Claude Code (headless `claude -p`); finished reviews expose
-//!   the saved report and a Terminal hand-off to resume the session.
+//!   in bulk by Claude Code: each selected PR gets an interactive `claude`
+//!   in a shared tmux session, so the run is visible and continuable like
+//!   normal terminal usage.
 //! - **stats**: aggregated review activity for the last N days.
 //!
-//! Fetching and AI review runs happen on background threads and results are
-//! delivered over channels, so subprocesses never block the UI thread.
+//! Fetching runs on a background thread and the result is delivered over a
+//! channel, so the gh subprocess never blocks the UI thread.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -81,13 +82,12 @@ enum ViewState {
 
 /// Lifecycle of the Claude review for one PR (absent = not started).
 enum AiReview {
-    Running,
+    /// An interactive run was started in the tmux session.
+    Launched,
+    /// A finished headless run (loaded from ai_sessions.json).
     Done(AiSessionRecord),
     Failed(String),
 }
-
-/// `(PR URL, outcome)` delivered from a review thread.
-type AiResult = (String, Result<AiSessionRecord, String>);
 
 /// Row interactions collected while drawing the table (which only has `&self`)
 /// and applied to `self` afterwards.
@@ -99,6 +99,8 @@ struct TableActions {
     open_report: Option<String>,
     /// Session id to resume in Terminal.
     resume: Option<String>,
+    /// Open a Terminal attached to the review tmux session.
+    open_tmux: bool,
 }
 
 pub struct App {
@@ -130,13 +132,10 @@ pub struct App {
     selected: HashSet<String>,
     /// AI review state per PR URL. Persisted `Done` entries survive restarts.
     ai: HashMap<String, AiReview>,
-    ai_tx: Sender<AiResult>,
-    ai_rx: Receiver<AiResult>,
 }
 
 impl App {
     pub fn new(gh_path: String) -> Self {
-        let (ai_tx, ai_rx) = channel();
         let ai = claude::load_sessions()
             .into_iter()
             .map(|(url, record)| (url, AiReview::Done(record)))
@@ -163,8 +162,6 @@ impl App {
             claude_path: "claude".to_string(),
             selected: HashSet::new(),
             ai,
-            ai_tx,
-            ai_rx,
         }
     }
 
@@ -233,37 +230,6 @@ impl App {
         }
     }
 
-    /// Drain finished AI review jobs and persist newly completed sessions.
-    fn poll_ai(&mut self) {
-        let mut finished = false;
-        while let Ok((url, result)) = self.ai_rx.try_recv() {
-            match result {
-                Ok(record) => {
-                    self.ai.insert(url, AiReview::Done(record));
-                    finished = true;
-                }
-                Err(message) => {
-                    self.ai.insert(url, AiReview::Failed(message));
-                }
-            }
-        }
-        if finished {
-            self.save_ai_sessions();
-        }
-    }
-
-    fn save_ai_sessions(&self) {
-        let sessions: HashMap<String, AiSessionRecord> = self
-            .ai
-            .iter()
-            .filter_map(|(url, state)| match state {
-                AiReview::Done(record) => Some((url.clone(), record.clone())),
-                _ => None,
-            })
-            .collect();
-        claude::save_sessions(&sessions);
-    }
-
     /// Check every actionable (waiting / should) visible PR.
     fn select_actionable(&mut self) {
         let ViewState::Ready(Loaded::Status(prs)) = &self.state else {
@@ -278,39 +244,45 @@ impl App {
                     ReviewStatus::RequestedUntouched | ReviewStatus::RequestedOthersReviewed
                 )
             })
-            .filter(|pr| !matches!(self.ai.get(&pr.url), Some(AiReview::Running)))
             .map(|pr| pr.url.clone())
             .collect();
         self.selected.extend(urls);
     }
 
-    /// Kick off one headless review thread per selected PR.
-    fn start_ai_reviews(&mut self, ctx: &egui::Context) {
+    /// Launch one interactive `claude` per selected PR in the tmux session,
+    /// then open a Terminal attached to it (unless one is already attached).
+    /// Launching is just a few tmux commands, so it runs on the UI thread.
+    fn start_ai_reviews(&mut self) {
         let ViewState::Ready(Loaded::Status(prs)) = &self.state else {
             return;
         };
         let targets: Vec<(String, String)> = prs
             .iter()
             .filter(|pr| self.selected.contains(&pr.url))
-            .filter(|pr| !matches!(self.ai.get(&pr.url), Some(AiReview::Running)))
             .map(|pr| (pr.url.clone(), pr.pr_key()))
             .collect();
+        if targets.is_empty() {
+            return;
+        }
 
+        let client = ClaudeClient::new(self.claude_path.clone());
+        let mut launched_any = false;
         for (url, pr_key) in targets {
             self.selected.remove(&url);
-            self.ai.insert(url.clone(), AiReview::Running);
-
-            let tx = self.ai_tx.clone();
-            let ctx = ctx.clone();
-            let claude_path = self.claude_path.clone();
-            std::thread::spawn(move || {
-                let client = ClaudeClient::new(claude_path);
-                let result = client
-                    .run_review(&url, &pr_key)
-                    .map_err(|err| format!("{err:#}"));
-                let _ = tx.send((url, result));
-                ctx.request_repaint();
-            });
+            match client.launch_review_in_tmux(&url, &pr_key) {
+                Ok(()) => {
+                    self.ai.insert(url, AiReview::Launched);
+                    launched_any = true;
+                }
+                Err(err) => {
+                    self.ai.insert(url, AiReview::Failed(format!("{err:#}")));
+                }
+            }
+        }
+        if launched_any {
+            if let Err(err) = client.open_tmux_terminal(true) {
+                eprintln!("warning: {err:#}");
+            }
         }
     }
 
@@ -328,6 +300,12 @@ impl App {
         if let Some(session_id) = actions.resume {
             let client = ClaudeClient::new(self.claude_path.clone());
             if let Err(err) = client.open_resume_terminal(&session_id) {
+                eprintln!("warning: {err:#}");
+            }
+        }
+        if actions.open_tmux {
+            let client = ClaudeClient::new(self.claude_path.clone());
+            if let Err(err) = client.open_tmux_terminal(false) {
                 eprintln!("warning: {err:#}");
             }
         }
@@ -362,7 +340,7 @@ impl App {
                     ui.separator();
                     if ui
                         .button("未対応を選択")
-                        .on_hover_text("waiting / should の PR をまとめて選択")
+                        .on_hover_text("waiting / should の PR をまとめて選択（個別には行頭のチェックボックスで）")
                         .clicked()
                     {
                         self.select_actionable();
@@ -373,10 +351,10 @@ impl App {
                             count > 0,
                             egui::Button::new(format!("AIレビュー実行 ({count})")),
                         )
-                        .on_hover_text("選択した PR ごとに claude のレビュースキルを実行")
+                        .on_hover_text("選択した PR ごとに tmux 上で claude を起動（実行の様子をターミナルで確認できます）")
                         .clicked()
                     {
-                        self.start_ai_reviews(ctx);
+                        self.start_ai_reviews();
                     }
                     if count > 0 && ui.button("解除").clicked() {
                         self.selected.clear();
@@ -443,7 +421,7 @@ impl App {
             .column(Column::auto()) // AI
             .header(20.0, |mut header| {
                 for label in [
-                    "", "status", "PR", "author", "title", "mine", "others", "requested",
+                    "選択", "status", "PR", "author", "title", "mine", "others", "requested",
                     "updated", "AI",
                 ] {
                     header.col(|ui| {
@@ -534,9 +512,14 @@ impl App {
             None => {
                 ui.label("-");
             }
-            Some(AiReview::Running) => {
-                ui.add(egui::Spinner::new().size(14.0))
-                    .on_hover_text("AIレビューを実行中…");
+            Some(AiReview::Launched) => {
+                if ui
+                    .small_button("tmux")
+                    .on_hover_text("tmux セッション gh-review で実行中。クリックでターミナルを開く")
+                    .clicked()
+                {
+                    actions.open_tmux = true;
+                }
             }
             Some(AiReview::Done(record)) => {
                 ui.horizontal(|ui| {
@@ -911,7 +894,6 @@ impl eframe::App for App {
             self.start_fetch(ctx);
         }
         self.poll();
-        self.poll_ai();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             self.toolbar(ui, ctx);
@@ -930,11 +912,6 @@ impl eframe::App for App {
             ViewState::Ready(Loaded::Stats(stats)) => self.stats_view(ui, stats),
         });
         self.apply_table_actions(actions);
-
-        // Keep spinners animating and pick up finished jobs promptly.
-        if self.ai.values().any(|state| matches!(state, AiReview::Running)) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
-        }
 
         self.settings_window(ctx);
     }
