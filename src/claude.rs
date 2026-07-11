@@ -255,6 +255,11 @@ impl ClaudeClient {
             let _ = tmux_run(&tmux, &["set-option", "-w", "-t", &pane_id, "automatic-rename", "off"]);
             let _ = tmux_run(&tmux, &["set-option", "-w", "-t", &pane_id, "allow-rename", "off"]);
         }
+        // Mouse support, applied on every launch so it also reaches sessions
+        // created by older builds: clicking a window name in the status bar
+        // switches tabs, and wheel scrolling works. (Native text selection
+        // needs Shift while the mouse is captured by tmux.)
+        let _ = tmux_run(&tmux, &["set-option", "-t", TMUX_SESSION, "mouse", "on"]);
         Ok(())
     }
 
