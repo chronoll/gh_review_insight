@@ -288,21 +288,30 @@ impl ClaudeClient {
         if !pids.is_empty() {
             // Terminal tabs are matched by tty. A client's own tty can differ
             // from the tab's (shell wrappers allocate their own pty), so
-            // collect the ttys of the client process and all its ancestors.
+            // collect the ttys of the client process and all its ancestors,
+            // noting which terminal app hosts the client along the way.
             let mut ttys: Vec<String> = Vec::new();
+            let mut ghostty_hosted = false;
             for pid in &pids {
-                for tty in process_tree_ttys(pid) {
+                let info = process_tree_info(pid);
+                ghostty_hosted |= info.ghostty;
+                for tty in info.ttys {
                     if !ttys.contains(&tty) {
                         ttys.push(tty);
                     }
                 }
+            }
+            if ghostty_hosted {
+                // Ghostty has no AppleScript dictionary, so the specific
+                // window cannot be selected; raising the app is best effort.
+                return activate_app("Ghostty");
             }
             let tty_refs: Vec<&str> = ttys.iter().map(String::as_str).collect();
             if (!tty_refs.is_empty() && raise_terminal_window(&tty_refs)?) || keep_existing {
                 return Ok(());
             }
         }
-        open_in_terminal(&format!(
+        open_shell_in_terminal(&format!(
             "{} attach -t {}",
             sh_quote(&tmux),
             sh_quote(TMUX_SESSION),
@@ -362,18 +371,50 @@ impl ClaudeClient {
         })
     }
 
-    /// Open Terminal.app and resume the review session interactively. The
+    /// Open a terminal and resume the review session interactively. The
     /// shell cd's into the workspace first because Claude Code looks up
     /// sessions per project directory.
     pub fn open_resume_terminal(&self, session_id: &str) -> Result<()> {
         let workspace = workspace_dir()?;
-        open_in_terminal(&format!(
+        open_shell_in_terminal(&format!(
             "cd {} && {} --resume {}",
             sh_quote(&workspace.to_string_lossy()),
             sh_quote(&resolve_claude(&self.claude_path)),
             sh_quote(session_id),
         ))
     }
+}
+
+/// Path of the Ghostty app bundle, when installed.
+fn ghostty_app() -> Option<PathBuf> {
+    let mut candidates = vec![PathBuf::from("/Applications/Ghostty.app")];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join("Applications/Ghostty.app"));
+    }
+    candidates.into_iter().find(|path| path.exists())
+}
+
+/// Open a shell command in a new window of the user's terminal: Ghostty when
+/// installed, Terminal.app otherwise.
+fn open_shell_in_terminal(shell: &str) -> Result<()> {
+    match ghostty_app() {
+        Some(app) => open_in_ghostty(&app, shell),
+        None => open_in_terminal(shell),
+    }
+}
+
+/// Open a new Ghostty window running a shell command. macOS Ghostty has no
+/// IPC to reach the running instance (`ghostty +new-window` is Linux-only);
+/// `open -na` is the way its own CLI help recommends.
+fn open_in_ghostty(app: &Path, shell: &str) -> Result<()> {
+    Command::new("open")
+        .arg("-na")
+        .arg(app)
+        .args(["--args", "-e", "/bin/zsh", "-lc"])
+        .arg(shell)
+        .spawn()
+        .context("Ghostty を開けませんでした")?;
+    Ok(())
 }
 
 /// Open Terminal.app and run a shell command in a new window.
@@ -390,18 +431,42 @@ fn open_in_terminal(shell: &str) -> Result<()> {
     Ok(())
 }
 
-/// The ttys of a process and its ancestors (as `/dev/ttysNNN`), walking up
-/// the parent chain until launchd. Used to find which Terminal tab hosts a
-/// tmux client even when a shell wrapper puts the client on its own pty.
-fn process_tree_ttys(pid: &str) -> Vec<String> {
-    let mut ttys = Vec::new();
+/// Bring an app (all of its windows) to the front.
+fn activate_app(name: &str) -> Result<()> {
+    let script = format!(
+        "tell application \"{}\" to activate",
+        applescript_escape(name),
+    );
+    Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .spawn()
+        .with_context(|| format!("{name} を前面に表示できませんでした"))?;
+    Ok(())
+}
+
+/// What hosts a tmux client, learned by walking up its process ancestry.
+#[derive(Default)]
+struct ProcessTreeInfo {
+    /// ttys of the process and its ancestors (as `/dev/ttysNNN`). A shell
+    /// wrapper can put the client on its own pty, so the hosting Terminal
+    /// tab's tty may only appear further up the chain.
+    ttys: Vec<String>,
+    /// An ancestor lives in Ghostty.app (the client runs in a Ghostty window).
+    ghostty: bool,
+}
+
+/// Walk a process's parent chain up to launchd, collecting ttys and the
+/// hosting terminal app.
+fn process_tree_info(pid: &str) -> ProcessTreeInfo {
+    let mut info = ProcessTreeInfo::default();
     let mut pid: i64 = pid.trim().parse().unwrap_or(0);
     for _ in 0..16 {
         if pid <= 1 {
             break;
         }
         let Ok(output) = Command::new("ps")
-            .args(["-o", "ppid=,tty=", "-p", &pid.to_string()])
+            .args(["-o", "ppid=,tty=,comm=", "-p", &pid.to_string()])
             .output()
         else {
             break;
@@ -414,15 +479,19 @@ fn process_tree_ttys(pid: &str) -> Vec<String> {
         let (Some(ppid), Some(tty)) = (fields.next(), fields.next()) else {
             break;
         };
+        let comm = fields.collect::<Vec<_>>().join(" ");
+        if comm.contains("Ghostty.app") {
+            info.ghostty = true;
+        }
         if tty != "??" {
             let tty = format!("/dev/{tty}");
-            if !ttys.contains(&tty) {
-                ttys.push(tty);
+            if !info.ttys.contains(&tty) {
+                info.ttys.push(tty);
             }
         }
         pid = ppid.parse().unwrap_or(0);
     }
-    ttys
+    info
 }
 
 /// Bring the Terminal.app window whose tab hosts one of `ttys` to the front.
@@ -576,11 +645,11 @@ mod tests {
     }
 
     #[test]
-    fn process_tree_ttys_handles_bogus_pids() {
-        assert!(process_tree_ttys("0").is_empty());
-        assert!(process_tree_ttys("not-a-pid").is_empty());
+    fn process_tree_info_handles_bogus_pids() {
+        assert!(process_tree_info("0").ttys.is_empty());
+        assert!(process_tree_info("not-a-pid").ttys.is_empty());
         // A real pid must not panic (tty presence depends on the environment).
-        let _ = process_tree_ttys(&std::process::id().to_string());
+        let _ = process_tree_info(&std::process::id().to_string());
     }
 
     #[test]
