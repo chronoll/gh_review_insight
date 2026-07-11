@@ -82,8 +82,9 @@ enum ViewState {
 
 /// Lifecycle of the Claude review for one PR (absent = not started).
 enum AiReview {
-    /// An interactive run was started in the tmux session.
-    Launched,
+    /// An interactive run was started in the tmux session; holds the pane id
+    /// used to focus this PR's tab.
+    Launched(String),
     /// A finished headless run (loaded from ai_sessions.json).
     Done(AiSessionRecord),
     Failed(String),
@@ -99,8 +100,8 @@ struct TableActions {
     open_report: Option<String>,
     /// Session id to resume in Terminal.
     resume: Option<String>,
-    /// Open a Terminal attached to the review tmux session.
-    open_tmux: bool,
+    /// Pane id whose tmux tab should be focused and brought to the front.
+    focus_tmux: Option<String>,
 }
 
 pub struct App {
@@ -270,8 +271,8 @@ impl App {
         for (url, pr_key) in targets {
             self.selected.remove(&url);
             match client.launch_review_in_tmux(&url, &pr_key) {
-                Ok(()) => {
-                    self.ai.insert(url, AiReview::Launched);
+                Ok(pane_id) => {
+                    self.ai.insert(url, AiReview::Launched(pane_id));
                     launched_any = true;
                 }
                 Err(err) => {
@@ -303,9 +304,9 @@ impl App {
                 eprintln!("warning: {err:#}");
             }
         }
-        if actions.open_tmux {
+        if let Some(pane_id) = actions.focus_tmux {
             let client = ClaudeClient::new(self.claude_path.clone());
-            if let Err(err) = client.show_tmux_terminal(false) {
+            if let Err(err) = client.focus_review_window(&pane_id) {
                 eprintln!("warning: {err:#}");
             }
         }
@@ -512,13 +513,13 @@ impl App {
             None => {
                 ui.label("-");
             }
-            Some(AiReview::Launched) => {
+            Some(AiReview::Launched(pane_id)) => {
                 if ui
                     .small_button("tmux")
-                    .on_hover_text("tmux セッション gh-review で実行中。クリックでレビューウィンドウを前面に表示")
+                    .on_hover_text("tmux セッション gh-review で実行中。クリックでこの PR のタブを前面に表示")
                     .clicked()
                 {
-                    actions.open_tmux = true;
+                    actions.focus_tmux = Some(pane_id.clone());
                 }
             }
             Some(AiReview::Done(record)) => {

@@ -218,9 +218,10 @@ impl ClaudeClient {
     /// Start an interactive `claude` for one PR inside the shared tmux
     /// session (created on first use), so the run is visible and continuable
     /// like normal terminal usage. Each PR gets its own tmux window (a tab
-    /// in the status bar) named after the PR. Returns quickly; the review
-    /// itself keeps running in its window.
-    pub fn launch_review_in_tmux(&self, pr_url: &str, pr_key: &str) -> Result<()> {
+    /// in the status bar) named after the PR. Returns quickly with the new
+    /// pane's id (used to focus this PR's tab later); the review itself
+    /// keeps running in its window.
+    pub fn launch_review_in_tmux(&self, pr_url: &str, pr_key: &str) -> Result<String> {
         let workspace = workspace_dir()?;
         std::fs::create_dir_all(&workspace)
             .context("workspace ディレクトリを作成できませんでした")?;
@@ -260,7 +261,19 @@ impl ClaudeClient {
         // switches tabs, and wheel scrolling works. (Native text selection
         // needs Shift while the mouse is captured by tmux.)
         let _ = tmux_run(&tmux, &["set-option", "-t", TMUX_SESSION, "mouse", "on"]);
-        Ok(())
+        Ok(pane_id)
+    }
+
+    /// Switch the review session to the tab hosting `pane_id`, then bring
+    /// the terminal to the front (or open one). Selecting the window is best
+    /// effort: it fails when the pane is gone (e.g. claude was exited), in
+    /// which case the session is shown as-is.
+    pub fn focus_review_window(&self, pane_id: &str) -> Result<()> {
+        let tmux = resolve_tmux();
+        if !pane_id.is_empty() && tmux_has_session(&tmux) {
+            let _ = tmux_run(&tmux, &["select-window", "-t", pane_id]);
+        }
+        self.show_tmux_terminal(false)
     }
 
     /// Show the review tmux session in Terminal.app. When a client is
