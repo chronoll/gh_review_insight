@@ -405,12 +405,14 @@ fn open_shell_in_terminal(shell: &str) -> Result<()> {
 
 /// Open a new Ghostty window running a shell command. macOS Ghostty has no
 /// IPC to reach the running instance (`ghostty +new-window` is Linux-only);
-/// `open -na` is the way its own CLI help recommends.
+/// `open -na` is the way its own CLI help recommends. The spawned instance
+/// would restore the saved window state (duplicating the user's existing
+/// windows), so state saving is disabled to keep the window standalone.
 fn open_in_ghostty(app: &Path, shell: &str) -> Result<()> {
     Command::new("open")
         .arg("-na")
         .arg(app)
-        .args(["--args", "-e", "/bin/zsh", "-lc"])
+        .args(["--args", "--window-save-state=never", "-e", "/bin/zsh", "-lc"])
         .arg(shell)
         .spawn()
         .context("Ghostty を開けませんでした")?;
