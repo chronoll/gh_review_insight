@@ -280,7 +280,7 @@ impl App {
             }
         }
         if launched_any {
-            if let Err(err) = client.open_tmux_terminal(true) {
+            if let Err(err) = client.show_tmux_terminal(true) {
                 eprintln!("warning: {err:#}");
             }
         }
@@ -305,7 +305,7 @@ impl App {
         }
         if actions.open_tmux {
             let client = ClaudeClient::new(self.claude_path.clone());
-            if let Err(err) = client.open_tmux_terminal(false) {
+            if let Err(err) = client.show_tmux_terminal(false) {
                 eprintln!("warning: {err:#}");
             }
         }
@@ -515,7 +515,7 @@ impl App {
             Some(AiReview::Launched) => {
                 if ui
                     .small_button("tmux")
-                    .on_hover_text("tmux セッション gh-review で実行中。クリックでターミナルを開く")
+                    .on_hover_text("tmux セッション gh-review で実行中。クリックでレビューウィンドウを前面に表示")
                     .clicked()
                 {
                     actions.open_tmux = true;

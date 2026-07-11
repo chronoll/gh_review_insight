@@ -267,17 +267,38 @@ impl ClaudeClient {
         Ok(())
     }
 
-    /// Open Terminal.app attached to the review tmux session. With
-    /// `only_if_detached`, does nothing when a client is already attached
-    /// (used right after launching, to avoid piling up windows).
-    pub fn open_tmux_terminal(&self, only_if_detached: bool) -> Result<()> {
+    /// Show the review tmux session in Terminal.app. When a client is
+    /// already attached, its window is raised instead of attaching again
+    /// (a second attach would just mirror the session). When nothing is
+    /// attached, a new attached Terminal window is opened. With
+    /// `keep_existing`, an attached client that cannot be raised (e.g. it
+    /// lives in another terminal app) is left alone instead of opening a
+    /// mirror; used right after launching reviews.
+    pub fn show_tmux_terminal(&self, keep_existing: bool) -> Result<()> {
         let tmux = resolve_tmux();
         if !tmux_has_session(&tmux) {
             return Err(anyhow!("tmux セッション {TMUX_SESSION} がありません。"));
         }
-        if only_if_detached {
-            let clients = tmux_run(&tmux, &["list-clients", "-t", TMUX_SESSION])?;
-            if !clients.trim().is_empty() {
+        let clients = tmux_run(&tmux, &["list-clients", "-t", TMUX_SESSION, "-F", "#{client_pid}"])?;
+        let pids: Vec<&str> = clients
+            .lines()
+            .map(str::trim)
+            .filter(|pid| !pid.is_empty())
+            .collect();
+        if !pids.is_empty() {
+            // Terminal tabs are matched by tty. A client's own tty can differ
+            // from the tab's (shell wrappers allocate their own pty), so
+            // collect the ttys of the client process and all its ancestors.
+            let mut ttys: Vec<String> = Vec::new();
+            for pid in &pids {
+                for tty in process_tree_ttys(pid) {
+                    if !ttys.contains(&tty) {
+                        ttys.push(tty);
+                    }
+                }
+            }
+            let tty_refs: Vec<&str> = ttys.iter().map(String::as_str).collect();
+            if (!tty_refs.is_empty() && raise_terminal_window(&tty_refs)?) || keep_existing {
                 return Ok(());
             }
         }
@@ -367,6 +388,80 @@ fn open_in_terminal(shell: &str) -> Result<()> {
         .spawn()
         .context("Terminal を開けませんでした")?;
     Ok(())
+}
+
+/// The ttys of a process and its ancestors (as `/dev/ttysNNN`), walking up
+/// the parent chain until launchd. Used to find which Terminal tab hosts a
+/// tmux client even when a shell wrapper puts the client on its own pty.
+fn process_tree_ttys(pid: &str) -> Vec<String> {
+    let mut ttys = Vec::new();
+    let mut pid: i64 = pid.trim().parse().unwrap_or(0);
+    for _ in 0..16 {
+        if pid <= 1 {
+            break;
+        }
+        let Ok(output) = Command::new("ps")
+            .args(["-o", "ppid=,tty=", "-p", &pid.to_string()])
+            .output()
+        else {
+            break;
+        };
+        if !output.status.success() {
+            break;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut fields = text.split_whitespace();
+        let (Some(ppid), Some(tty)) = (fields.next(), fields.next()) else {
+            break;
+        };
+        if tty != "??" {
+            let tty = format!("/dev/{tty}");
+            if !ttys.contains(&tty) {
+                ttys.push(tty);
+            }
+        }
+        pid = ppid.parse().unwrap_or(0);
+    }
+    ttys
+}
+
+/// Bring the Terminal.app window whose tab hosts one of `ttys` to the front.
+/// Returns `false` when no Terminal tab matches, e.g. when the tmux client
+/// is attached from another terminal app.
+fn raise_terminal_window(ttys: &[&str]) -> Result<bool> {
+    let list = ttys
+        .iter()
+        .map(|tty| format!("\"{}\"", applescript_escape(tty)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let script = r#"tell application "Terminal"
+    set targetTtys to {TTYS}
+    repeat with w in windows
+        repeat with t in tabs of w
+            if (tty of t) is in targetTtys then
+                set index of w to 1
+                set selected tab of w to t
+                activate
+                return "found"
+            end if
+        end repeat
+    end repeat
+end tell
+return """#
+        .replace("TTYS", &list);
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .context("Terminal のウィンドウ検索に失敗しました")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "Terminal のウィンドウ検索に失敗しました: {}",
+            stderr.trim(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "found")
 }
 
 fn workspace_dir() -> Result<PathBuf> {
@@ -478,6 +573,14 @@ mod tests {
 
         // Records without a session id are dropped.
         assert_eq!(AiSessionRecord::from_value(&json!({"report_path": "x"})), None);
+    }
+
+    #[test]
+    fn process_tree_ttys_handles_bogus_pids() {
+        assert!(process_tree_ttys("0").is_empty());
+        assert!(process_tree_ttys("not-a-pid").is_empty());
+        // A real pid must not panic (tty presence depends on the environment).
+        let _ = process_tree_ttys(&std::process::id().to_string());
     }
 
     #[test]
