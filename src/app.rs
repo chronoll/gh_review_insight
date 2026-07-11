@@ -250,9 +250,15 @@ impl App {
                     ReviewStatus::RequestedUntouched | ReviewStatus::RequestedOthersReviewed
                 )
             })
+            .filter(|pr| !self.is_launched(&pr.url))
             .map(|pr| pr.url.clone())
             .collect();
         self.selected.extend(urls);
+    }
+
+    /// True while the PR has a live tmux tab (a duplicate run makes no sense).
+    fn is_launched(&self, url: &str) -> bool {
+        matches!(self.ai.get(url), Some(AiReview::Launched(_)))
     }
 
     /// Launch one interactive `claude` per selected PR in the tmux session,
@@ -265,6 +271,7 @@ impl App {
         let targets: Vec<(String, String)> = prs
             .iter()
             .filter(|pr| self.selected.contains(&pr.url))
+            .filter(|pr| !self.is_launched(&pr.url))
             .map(|pr| (pr.url.clone(), pr.pr_key()))
             .collect();
         if targets.is_empty() {
@@ -455,8 +462,15 @@ impl App {
                     body.row(24.0, |mut row| {
                         row.col(|ui| {
                             fill_cell(ui, tint);
-                            let mut checked = self.selected.contains(&pr.url);
-                            if ui.checkbox(&mut checked, "").changed() {
+                            let launched = self.is_launched(&pr.url);
+                            let mut checked = !launched && self.selected.contains(&pr.url);
+                            if ui
+                                .add_enabled(!launched, egui::Checkbox::without_text(&mut checked))
+                                .on_disabled_hover_text(
+                                    "実行中の tmux タブがあるため選択できません",
+                                )
+                                .changed()
+                            {
                                 actions.toggle.push(pr.url.clone());
                             }
                         });
