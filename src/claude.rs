@@ -217,8 +217,9 @@ impl ClaudeClient {
 
     /// Start an interactive `claude` for one PR inside the shared tmux
     /// session (created on first use), so the run is visible and continuable
-    /// like normal terminal usage. Returns quickly; the review itself keeps
-    /// running in its pane.
+    /// like normal terminal usage. Each PR gets its own tmux window (a tab
+    /// in the status bar) named after the PR. Returns quickly; the review
+    /// itself keeps running in its window.
     pub fn launch_review_in_tmux(&self, pr_url: &str, pr_key: &str) -> Result<()> {
         let workspace = workspace_dir()?;
         std::fs::create_dir_all(&workspace)
@@ -230,39 +231,29 @@ impl ClaudeClient {
             sh_quote(&resolve_claude(&self.claude_path)),
             sh_quote(&review_prompt(pr_url)),
         );
+        // Tab label: `owner/repo#42` -> `repo#42` (matches the GUI's PR column).
+        let window_name = pr_key.rsplit('/').next().unwrap_or(pr_key);
 
         let pane_id = if tmux_has_session(&tmux) {
-            // Add a pane to the existing window; fall back to a new window
-            // when the layout has no room left.
             let target = format!("{TMUX_SESSION}:");
-            let split = tmux_run(
+            tmux_run(
                 &tmux,
-                &["split-window", "-d", "-P", "-F", "#{pane_id}", "-t", &target, "-c", &cwd, &command],
-            );
-            match split {
-                Ok(pane_id) => {
-                    tmux_run(&tmux, &["select-layout", "-t", &target, "tiled"])?;
-                    pane_id
-                }
-                Err(_) => tmux_run(
-                    &tmux,
-                    &["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", &target, "-c", &cwd, &command],
-                )?,
-            }
+                &["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", &target, "-n", window_name, "-c", &cwd, &command],
+            )?
         } else {
             tmux_run(
                 &tmux,
-                &["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", TMUX_SESSION, "-c", &cwd, &command],
+                &["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", TMUX_SESSION, "-n", window_name, "-c", &cwd, &command],
             )?
         };
 
         let pane_id = pane_id.trim().to_string();
         if !pane_id.is_empty() {
-            // Show the PR key on the pane border, and keep claude's own
-            // title updates from overwriting it (allow-set-title off).
-            let _ = tmux_run(&tmux, &["set-option", "-w", "-t", &pane_id, "pane-border-status", "top"]);
-            let _ = tmux_run(&tmux, &["set-option", "-w", "-t", &pane_id, "allow-set-title", "off"]);
-            let _ = tmux_run(&tmux, &["select-pane", "-t", &pane_id, "-T", pr_key]);
+            // Keep the window name fixed on the PR: no rename from the
+            // running command (automatic-rename) nor from the application's
+            // title escape sequences (allow-rename).
+            let _ = tmux_run(&tmux, &["set-option", "-w", "-t", &pane_id, "automatic-rename", "off"]);
+            let _ = tmux_run(&tmux, &["set-option", "-w", "-t", &pane_id, "allow-rename", "off"]);
         }
         Ok(())
     }
