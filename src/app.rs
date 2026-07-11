@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use crate::claude::{self, AiSessionRecord, ClaudeClient};
+use crate::claude::{self, AiSessionRecord, ClaudeClient, LaunchedRecord};
 use crate::config::{colors_path, excludes_path, ignored_path, load_colors, load_excludes, load_ignored};
 
 use eframe::egui;
@@ -82,9 +82,10 @@ enum ViewState {
 
 /// Lifecycle of the Claude review for one PR (absent = not started).
 enum AiReview {
-    /// An interactive run was started in the tmux session; holds the pane id
-    /// used to focus this PR's tab.
-    Launched(String),
+    /// An interactive run in the tmux session; holds the pane identity used
+    /// to focus this PR's tab. Persisted and restored across app restarts
+    /// while the pane is alive.
+    Launched(LaunchedRecord),
     /// A finished headless run (loaded from ai_sessions.json).
     Done(AiSessionRecord),
     Failed(String),
@@ -137,10 +138,14 @@ pub struct App {
 
 impl App {
     pub fn new(gh_path: String) -> Self {
-        let ai = claude::load_sessions()
+        let mut ai: HashMap<String, AiReview> = claude::load_sessions()
             .into_iter()
             .map(|(url, record)| (url, AiReview::Done(record)))
             .collect();
+        // Live tmux runs win over older headless records for the same PR.
+        for (url, record) in claude::load_launched_reviews() {
+            ai.insert(url, AiReview::Launched(record));
+        }
         Self {
             gh_path,
             user: "@me".to_string(),
@@ -271,8 +276,8 @@ impl App {
         for (url, pr_key) in targets {
             self.selected.remove(&url);
             match client.launch_review_in_tmux(&url, &pr_key) {
-                Ok(pane_id) => {
-                    self.ai.insert(url, AiReview::Launched(pane_id));
+                Ok(record) => {
+                    self.ai.insert(url, AiReview::Launched(record));
                     launched_any = true;
                 }
                 Err(err) => {
@@ -281,10 +286,24 @@ impl App {
             }
         }
         if launched_any {
+            self.save_launched();
             if let Err(err) = client.show_tmux_terminal(true) {
                 eprintln!("warning: {err:#}");
             }
         }
+    }
+
+    /// Persist the currently launched (tmux) reviews.
+    fn save_launched(&self) {
+        let launched: HashMap<String, LaunchedRecord> = self
+            .ai
+            .iter()
+            .filter_map(|(url, state)| match state {
+                AiReview::Launched(record) => Some((url.clone(), record.clone())),
+                _ => None,
+            })
+            .collect();
+        claude::save_launched_reviews(&launched);
     }
 
     fn apply_table_actions(&mut self, actions: TableActions) {
@@ -513,13 +532,13 @@ impl App {
             None => {
                 ui.label("-");
             }
-            Some(AiReview::Launched(pane_id)) => {
+            Some(AiReview::Launched(record)) => {
                 if ui
                     .small_button("tmux")
                     .on_hover_text("tmux セッション gh-review で実行中。クリックでこの PR のタブを前面に表示")
                     .clicked()
                 {
-                    actions.focus_tmux = Some(pane_id.clone());
+                    actions.focus_tmux = Some(record.pane_id.clone());
                 }
             }
             Some(AiReview::Done(record)) => {

@@ -156,6 +156,111 @@ impl AiSessionRecord {
     }
 }
 
+/// A review launched interactively in the tmux session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchedRecord {
+    /// tmux pane id (e.g. `%5`), used to focus this PR's tab.
+    pub pane_id: String,
+    /// The tab name the pane was created with (`repo#42`). Pane ids are
+    /// reused after a tmux restart, so the name double-checks identity.
+    pub window_name: String,
+}
+
+impl LaunchedRecord {
+    fn to_value(&self) -> Value {
+        serde_json::json!({
+            "pane_id": self.pane_id,
+            "window_name": self.window_name,
+        })
+    }
+
+    fn from_value(value: &Value) -> Option<Self> {
+        let pane_id = value["pane_id"].as_str()?.to_string();
+        if pane_id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            pane_id,
+            window_name: value["window_name"].as_str().unwrap_or("").to_string(),
+        })
+    }
+}
+
+/// Load persisted launched reviews, keeping only entries whose tmux pane is
+/// still alive with the expected tab name. The file is rewritten when stale
+/// entries were dropped.
+pub fn load_launched_reviews() -> HashMap<String, LaunchedRecord> {
+    let all = read_launched();
+    if all.is_empty() {
+        return all;
+    }
+    let live = live_panes(&resolve_tmux());
+    let kept: HashMap<String, LaunchedRecord> = all
+        .iter()
+        .filter(|(_, record)| live.get(&record.pane_id) == Some(&record.window_name))
+        .map(|(url, record)| (url.clone(), record.clone()))
+        .collect();
+    if kept.len() != all.len() {
+        save_launched_reviews(&kept);
+    }
+    kept
+}
+
+fn read_launched() -> HashMap<String, LaunchedRecord> {
+    let Some(path) = config::ai_launched_path() else {
+        return HashMap::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return HashMap::new();
+    };
+    let Some(map) = value.as_object() else {
+        return HashMap::new();
+    };
+    map.iter()
+        .filter_map(|(url, v)| LaunchedRecord::from_value(v).map(|r| (url.clone(), r)))
+        .collect()
+}
+
+/// Persist launched reviews, keyed by PR URL.
+pub fn save_launched_reviews(launched: &HashMap<String, LaunchedRecord>) {
+    let Some(path) = config::ai_launched_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let map: serde_json::Map<String, Value> = launched
+        .iter()
+        .map(|(url, record)| (url.clone(), record.to_value()))
+        .collect();
+    if let Ok(json) = serde_json::to_string_pretty(&Value::Object(map)) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// The live panes of the review session: pane id -> window (tab) name.
+fn live_panes(tmux: &str) -> HashMap<String, String> {
+    if !tmux_has_session(tmux) {
+        return HashMap::new();
+    }
+    tmux_run(
+        tmux,
+        &["list-panes", "-s", "-t", TMUX_SESSION, "-F", "#{pane_id}\t#{window_name}"],
+    )
+    .map(|out| {
+        out.lines()
+            .filter_map(|line| {
+                line.split_once('\t')
+                    .map(|(pane, name)| (pane.to_string(), name.to_string()))
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// Load persisted review sessions, keyed by PR URL.
 pub fn load_sessions() -> HashMap<String, AiSessionRecord> {
     let Some(path) = config::ai_sessions_path() else {
@@ -219,9 +324,9 @@ impl ClaudeClient {
     /// session (created on first use), so the run is visible and continuable
     /// like normal terminal usage. Each PR gets its own tmux window (a tab
     /// in the status bar) named after the PR. Returns quickly with the new
-    /// pane's id (used to focus this PR's tab later); the review itself
-    /// keeps running in its window.
-    pub fn launch_review_in_tmux(&self, pr_url: &str, pr_key: &str) -> Result<String> {
+    /// pane's identity (used to focus this PR's tab later); the review
+    /// itself keeps running in its window.
+    pub fn launch_review_in_tmux(&self, pr_url: &str, pr_key: &str) -> Result<LaunchedRecord> {
         let workspace = workspace_dir()?;
         std::fs::create_dir_all(&workspace)
             .context("workspace ディレクトリを作成できませんでした")?;
@@ -261,7 +366,10 @@ impl ClaudeClient {
         // switches tabs, and wheel scrolling works. (Native text selection
         // needs Shift while the mouse is captured by tmux.)
         let _ = tmux_run(&tmux, &["set-option", "-t", TMUX_SESSION, "mouse", "on"]);
-        Ok(pane_id)
+        Ok(LaunchedRecord {
+            pane_id,
+            window_name: window_name.to_string(),
+        })
     }
 
     /// Switch the review session to the tab hosting `pane_id`, then bring
@@ -667,6 +775,20 @@ mod tests {
     fn review_prompt_embeds_the_pr_url() {
         let prompt = review_prompt("https://github.com/acme/widgets/pull/42");
         assert!(prompt.contains("https://github.com/acme/widgets/pull/42"));
+    }
+
+    #[test]
+    fn launched_record_roundtrips_through_json() {
+        let record = LaunchedRecord {
+            pane_id: "%5".to_string(),
+            window_name: "widgets#42".to_string(),
+        };
+        assert_eq!(LaunchedRecord::from_value(&record.to_value()), Some(record));
+        // Records without a pane id are dropped.
+        assert_eq!(
+            LaunchedRecord::from_value(&serde_json::json!({"window_name": "x"})),
+            None
+        );
     }
 
     #[test]

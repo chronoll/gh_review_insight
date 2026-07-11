@@ -25,6 +25,11 @@ pub fn ai_sessions_path() -> Option<PathBuf> {
     Some(config_dir()?.join("ai_sessions.json"))
 }
 
+/// Launched (interactive tmux) AI reviews, keyed by PR URL.
+pub fn ai_launched_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("ai_launched.json"))
+}
+
 /// Working directory for headless `claude` runs. Review reports are saved
 /// under `<dir>/reviews/`, and sessions are resumed from this directory
 /// (Claude Code looks up sessions per project directory).
