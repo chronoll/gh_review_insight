@@ -366,6 +366,18 @@ impl ClaudeClient {
         // switches tabs, and wheel scrolling works. (Native text selection
         // needs Shift while the mouse is captured by tmux.)
         let _ = tmux_run(&tmux, &["set-option", "-t", TMUX_SESSION, "mouse", "on"]);
+        // Forward modifier-aware keys to inner apps in kitty CSI-u format so
+        // Shift+Enter inserts a newline in claude instead of submitting
+        // (tmux otherwise collapses it to a plain Enter). The extkeys
+        // terminal feature lets tmux request those keys from Ghostty; it is
+        // matched when a client attaches, so it only helps new attaches.
+        let _ = tmux_run(&tmux, &["set-option", "-s", "extended-keys", "on"]);
+        let _ = tmux_run(&tmux, &["set-option", "-s", "extended-keys-format", "csi-u"]);
+        if let Ok(features) = tmux_run(&tmux, &["show-options", "-s", "terminal-features"]) {
+            if !features.contains("extkeys") {
+                let _ = tmux_run(&tmux, &["set-option", "-as", "terminal-features", "xterm*:extkeys"]);
+            }
+        }
         Ok(LaunchedRecord {
             pane_id,
             window_name: window_name.to_string(),
