@@ -101,8 +101,8 @@ struct TableActions {
     open_report: Option<String>,
     /// Session id to resume in Terminal.
     resume: Option<String>,
-    /// Pane id whose tmux tab should be focused and brought to the front.
-    focus_tmux: Option<String>,
+    /// Launched run whose tab should be focused and brought to the front.
+    focus: Option<LaunchedRecord>,
 }
 
 pub struct App {
@@ -256,7 +256,8 @@ impl App {
         self.selected.extend(urls);
     }
 
-    /// True while the PR has a live tmux tab (a duplicate run makes no sense).
+    /// True while the PR has a live review tab (a duplicate run makes no
+    /// sense).
     fn is_launched(&self, url: &str) -> bool {
         matches!(self.ai.get(url), Some(AiReview::Launched(_)))
     }
@@ -282,7 +283,7 @@ impl App {
         let mut launched_any = false;
         for (url, pr_key) in targets {
             self.selected.remove(&url);
-            match client.launch_review_in_tmux(&url, &pr_key) {
+            match client.launch_review(&url, &pr_key) {
                 Ok(record) => {
                     self.ai.insert(url, AiReview::Launched(record));
                     launched_any = true;
@@ -294,7 +295,7 @@ impl App {
         }
         if launched_any {
             self.save_launched();
-            if let Err(err) = client.show_tmux_terminal(true) {
+            if let Err(err) = client.show_review_terminal(true) {
                 eprintln!("warning: {err:#}");
             }
         }
@@ -330,9 +331,9 @@ impl App {
                 eprintln!("warning: {err:#}");
             }
         }
-        if let Some(pane_id) = actions.focus_tmux {
+        if let Some(record) = actions.focus {
             let client = ClaudeClient::new(self.claude_path.clone());
-            if let Err(err) = client.focus_review_window(&pane_id) {
+            if let Err(err) = client.focus_review_window(&record) {
                 eprintln!("warning: {err:#}");
             }
         }
@@ -467,7 +468,7 @@ impl App {
                             if ui
                                 .add_enabled(!launched, egui::Checkbox::without_text(&mut checked))
                                 .on_disabled_hover_text(
-                                    "実行中の tmux タブがあるため選択できません",
+                                    "実行中のレビュータブがあるため選択できません",
                                 )
                                 .changed()
                             {
@@ -548,11 +549,11 @@ impl App {
             }
             Some(AiReview::Launched(record)) => {
                 if ui
-                    .small_button("tmux")
-                    .on_hover_text("tmux セッション gh-review で実行中。クリックでこの PR のタブを前面に表示")
+                    .small_button(record.backend.label())
+                    .on_hover_text("実行中。クリックでこの PR のタブを前面に表示")
                     .clicked()
                 {
-                    actions.focus_tmux = Some(record.pane_id.clone());
+                    actions.focus = Some(record.clone());
                 }
             }
             Some(AiReview::Done(record)) => {

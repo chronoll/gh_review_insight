@@ -1,9 +1,12 @@
 //! Claude Code CLI integration.
 //!
-//! The GUI launches one interactive `claude` per pull request inside a shared
-//! tmux session, so each run is visible (and continuable) exactly like normal
-//! terminal usage. A headless variant (`claude -p`, JSON output, saved report)
-//! is kept below for a possible future switch back.
+//! The GUI launches one interactive `claude` per pull request, so each run is
+//! visible (and continuable) exactly like normal terminal usage. Runs are
+//! hosted by herdr (a terminal workspace manager with a socket API) when it
+//! is installed — one herdr tab per PR in a dedicated workspace — otherwise
+//! by a shared tmux session with one window per PR. A headless variant
+//! (`claude -p`, JSON output, saved report) is kept below for a possible
+//! future switch back.
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
@@ -124,6 +127,126 @@ fn tmux_has_session(tmux: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// herdr workspace that hosts the review tabs.
+const HERDR_WORKSPACE_LABEL: &str = "gh-review";
+
+/// The herdr binary, when installed (preferred over tmux for review runs).
+fn find_herdr() -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".local/bin/herdr"));
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin/herdr"));
+    candidates.push(PathBuf::from("/usr/local/bin/herdr"));
+    candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// Run a herdr CLI command and return the JSON `result` payload. herdr
+/// reports failures as an `error` object, which is surfaced as the error.
+fn herdr_run(args: &[&str]) -> Result<Value> {
+    let herdr = find_herdr().ok_or_else(|| anyhow!("herdr が見つかりませんでした。"))?;
+    let output = Command::new(herdr)
+        .env("PATH", augmented_path())
+        .args(args)
+        .output()
+        .map_err(|err| anyhow!("herdr を実行できませんでした: {err}"))?;
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        anyhow!(if trimmed.is_empty() {
+            format!("herdr {} がJSON応答を返しませんでした。", args.first().unwrap_or(&""))
+        } else {
+            trimmed.to_string()
+        })
+    })?;
+    if let Some(error) = value.get("error") {
+        let message = error["message"].as_str().unwrap_or("不明なエラー");
+        return Err(anyhow!("herdr {}: {message}", args.first().unwrap_or(&"")));
+    }
+    Ok(value["result"].clone())
+}
+
+/// Find or create the dedicated review workspace, returning its id.
+fn ensure_herdr_workspace(cwd: &str) -> Result<String> {
+    let list = herdr_run(&["workspace", "list"])?;
+    let existing = list["workspaces"].as_array().and_then(|workspaces| {
+        workspaces
+            .iter()
+            .find(|ws| ws["label"].as_str() == Some(HERDR_WORKSPACE_LABEL))
+            .and_then(|ws| ws["workspace_id"].as_str())
+            .map(str::to_string)
+    });
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    let created = herdr_run(&[
+        "workspace", "create", "--label", HERDR_WORKSPACE_LABEL, "--no-focus", "--cwd", cwd,
+    ])?;
+    created["workspace"]["workspace_id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("herdr workspace create の応答から id を取得できませんでした。"))
+}
+
+/// The live review panes in the herdr workspace: terminal id -> label.
+/// Empty when herdr (or its server) is not running — panes are dead then.
+fn live_herdr_reviews() -> HashMap<String, String> {
+    let Ok(list) = herdr_run(&["workspace", "list"]) else {
+        return HashMap::new();
+    };
+    let Some(ws_id) = list["workspaces"].as_array().and_then(|workspaces| {
+        workspaces
+            .iter()
+            .find(|ws| ws["label"].as_str() == Some(HERDR_WORKSPACE_LABEL))
+            .and_then(|ws| ws["workspace_id"].as_str())
+            .map(str::to_string)
+    }) else {
+        return HashMap::new();
+    };
+    let Ok(panes) = herdr_run(&["pane", "list", "--workspace", &ws_id]) else {
+        return HashMap::new();
+    };
+    panes["panes"]
+        .as_array()
+        .map(|panes| {
+            panes
+                .iter()
+                .filter_map(|pane| {
+                    let terminal_id = pane["terminal_id"].as_str()?;
+                    let label = pane["label"].as_str()?;
+                    Some((terminal_id.to_string(), label.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Pids of attached herdr clients. The server has no controlling tty and
+/// transient CLI invocations carry a subcommand, so a client is a bare
+/// `herdr` (optionally with `--flags`) that has a tty.
+fn herdr_client_pids() -> Vec<String> {
+    let Ok(output) = Command::new("ps").args(["-axo", "pid=,tty=,args="]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?;
+            let tty = fields.next()?;
+            let cmd = fields.next()?;
+            let arg1 = fields.next();
+            let is_client = tty != "??"
+                && (cmd == "herdr" || cmd.ends_with("/herdr"))
+                && arg1.is_none_or(|arg| arg.starts_with('-'));
+            is_client.then(|| pid.to_string())
+        })
+        .collect()
+}
+
 /// A finished headless review: the session to resume and the saved report.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AiSessionRecord {
@@ -156,14 +279,33 @@ impl AiSessionRecord {
     }
 }
 
-/// A review launched interactively in the tmux session.
+/// Which multiplexer hosts a launched review.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchBackend {
+    Tmux,
+    Herdr,
+}
+
+impl LaunchBackend {
+    /// Short label shown on the focus button in the AI column.
+    pub fn label(self) -> &'static str {
+        match self {
+            LaunchBackend::Tmux => "tmux",
+            LaunchBackend::Herdr => "herdr",
+        }
+    }
+}
+
+/// A review launched interactively in a tmux session or herdr workspace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchedRecord {
-    /// tmux pane id (e.g. `%5`), used to focus this PR's tab.
+    /// tmux pane id (`%5`) or herdr terminal id (`term_…`), used to focus
+    /// this PR's tab.
     pub pane_id: String,
-    /// The tab name the pane was created with (`repo#42`). Pane ids are
-    /// reused after a tmux restart, so the name double-checks identity.
+    /// The tab name the run was created with (`repo#42`). Ids can be reused
+    /// after a server restart, so the name double-checks identity.
     pub window_name: String,
+    pub backend: LaunchBackend,
 }
 
 impl LaunchedRecord {
@@ -171,6 +313,10 @@ impl LaunchedRecord {
         serde_json::json!({
             "pane_id": self.pane_id,
             "window_name": self.window_name,
+            "backend": match self.backend {
+                LaunchBackend::Tmux => "tmux",
+                LaunchBackend::Herdr => "herdr",
+            },
         })
     }
 
@@ -182,22 +328,44 @@ impl LaunchedRecord {
         Some(Self {
             pane_id,
             window_name: value["window_name"].as_str().unwrap_or("").to_string(),
+            // Records written before herdr support are tmux ones.
+            backend: match value["backend"].as_str() {
+                Some("herdr") => LaunchBackend::Herdr,
+                _ => LaunchBackend::Tmux,
+            },
         })
     }
 }
 
-/// Load persisted launched reviews, keeping only entries whose tmux pane is
-/// still alive with the expected tab name. The file is rewritten when stale
-/// entries were dropped.
+/// Load persisted launched reviews, keeping only entries whose pane is still
+/// alive with the expected tab name in its backend. The file is rewritten
+/// when stale entries were dropped.
 pub fn load_launched_reviews() -> HashMap<String, LaunchedRecord> {
     let all = read_launched();
     if all.is_empty() {
         return all;
     }
-    let live = live_panes(&resolve_tmux());
+    let needs_tmux = all.values().any(|r| r.backend == LaunchBackend::Tmux);
+    let needs_herdr = all.values().any(|r| r.backend == LaunchBackend::Herdr);
+    let live_tmux = if needs_tmux {
+        live_panes(&resolve_tmux())
+    } else {
+        HashMap::new()
+    };
+    let live_herdr = if needs_herdr {
+        live_herdr_reviews()
+    } else {
+        HashMap::new()
+    };
     let kept: HashMap<String, LaunchedRecord> = all
         .iter()
-        .filter(|(_, record)| live.get(&record.pane_id) == Some(&record.window_name))
+        .filter(|(_, record)| {
+            let live = match record.backend {
+                LaunchBackend::Tmux => &live_tmux,
+                LaunchBackend::Herdr => &live_herdr,
+            };
+            live.get(&record.pane_id) == Some(&record.window_name)
+        })
         .map(|(url, record)| (url.clone(), record.clone()))
         .collect();
     if kept.len() != all.len() {
@@ -320,13 +488,58 @@ impl ClaudeClient {
         }
     }
 
-    /// Start an interactive `claude` for one PR inside the shared tmux
-    /// session (created on first use), so the run is visible and continuable
-    /// like normal terminal usage. Each PR gets its own tmux window (a tab
-    /// in the status bar) named after the PR. Returns quickly with the new
-    /// pane's identity (used to focus this PR's tab later); the review
-    /// itself keeps running in its window.
-    pub fn launch_review_in_tmux(&self, pr_url: &str, pr_key: &str) -> Result<LaunchedRecord> {
+    /// Start an interactive `claude` for one PR, one tab per PR. Runs in
+    /// herdr when it is installed, in a shared tmux session otherwise.
+    /// Returns quickly with the run's identity (used to focus its tab
+    /// later); the review itself keeps running in its tab.
+    pub fn launch_review(&self, pr_url: &str, pr_key: &str) -> Result<LaunchedRecord> {
+        if find_herdr().is_some() {
+            self.launch_review_in_herdr(pr_url, pr_key)
+        } else {
+            self.launch_review_in_tmux(pr_url, pr_key)
+        }
+    }
+
+    /// herdr flavor of `launch_review`: an agent in the dedicated review
+    /// workspace, moved into its own labeled tab.
+    fn launch_review_in_herdr(&self, pr_url: &str, pr_key: &str) -> Result<LaunchedRecord> {
+        let workspace = workspace_dir()?;
+        std::fs::create_dir_all(&workspace)
+            .context("workspace ディレクトリを作成できませんでした")?;
+        let cwd = workspace.to_string_lossy().into_owned();
+        let ws_id = ensure_herdr_workspace(&cwd)?;
+        let window_name = pr_key.rsplit('/').next().unwrap_or(pr_key);
+        let claude = resolve_claude(&self.claude_path);
+        let prompt = review_prompt(pr_url);
+
+        let started = herdr_run(&[
+            "agent", "start", window_name, "--workspace", &ws_id, "--cwd", &cwd, "--no-focus",
+            "--", &claude, &prompt,
+        ])?;
+        let agent = &started["agent"];
+        let terminal_id = agent["terminal_id"].as_str().unwrap_or("").to_string();
+        let pane_id = agent["pane_id"].as_str().unwrap_or("").to_string();
+        if terminal_id.is_empty() || pane_id.is_empty() {
+            return Err(anyhow!("herdr agent start の応答から id を取得できませんでした。"));
+        }
+        // `agent start` splits into the workspace's active tab; give the run
+        // its own labeled tab. The label doubles as the identity check used
+        // by the liveness filter, so a failure here is a real error.
+        herdr_run(&[
+            "pane", "move", &pane_id, "--new-tab", "--workspace", &ws_id, "--label", window_name,
+            "--no-focus",
+        ])?;
+
+        Ok(LaunchedRecord {
+            pane_id: terminal_id,
+            window_name: window_name.to_string(),
+            backend: LaunchBackend::Herdr,
+        })
+    }
+
+    /// tmux flavor of `launch_review`: one window (status-bar tab) per PR in
+    /// the shared session.
+    fn launch_review_in_tmux(&self, pr_url: &str, pr_key: &str) -> Result<LaunchedRecord> {
         let workspace = workspace_dir()?;
         std::fs::create_dir_all(&workspace)
             .context("workspace ディレクトリを作成できませんでした")?;
@@ -381,19 +594,51 @@ impl ClaudeClient {
         Ok(LaunchedRecord {
             pane_id,
             window_name: window_name.to_string(),
+            backend: LaunchBackend::Tmux,
         })
     }
 
-    /// Switch the review session to the tab hosting `pane_id`, then bring
-    /// the terminal to the front (or open one). Selecting the window is best
+    /// Switch the hosting backend to the tab of this run, then bring the
+    /// terminal to the front (or open one). Selecting the tab is best
     /// effort: it fails when the pane is gone (e.g. claude was exited), in
     /// which case the session is shown as-is.
-    pub fn focus_review_window(&self, pane_id: &str) -> Result<()> {
-        let tmux = resolve_tmux();
-        if !pane_id.is_empty() && tmux_has_session(&tmux) {
-            let _ = tmux_run(&tmux, &["select-window", "-t", pane_id]);
+    pub fn focus_review_window(&self, record: &LaunchedRecord) -> Result<()> {
+        match record.backend {
+            LaunchBackend::Herdr => {
+                let _ = herdr_run(&["agent", "focus", &record.pane_id]);
+                self.show_herdr_terminal(false)
+            }
+            LaunchBackend::Tmux => {
+                let tmux = resolve_tmux();
+                if !record.pane_id.is_empty() && tmux_has_session(&tmux) {
+                    let _ = tmux_run(&tmux, &["select-window", "-t", &record.pane_id]);
+                }
+                self.show_tmux_terminal(false)
+            }
         }
-        self.show_tmux_terminal(false)
+    }
+
+    /// Show whichever backend new launches go to (used right after a batch
+    /// launch, without piling up windows when one is already visible).
+    pub fn show_review_terminal(&self, keep_existing: bool) -> Result<()> {
+        if find_herdr().is_some() {
+            self.show_herdr_terminal(keep_existing)
+        } else {
+            self.show_tmux_terminal(keep_existing)
+        }
+    }
+
+    /// Show the herdr client in a terminal: raise the window hosting an
+    /// attached client when there is one, otherwise open a terminal running
+    /// `herdr` (which attaches to the persistent session).
+    fn show_herdr_terminal(&self, keep_existing: bool) -> Result<()> {
+        let pids = herdr_client_pids();
+        let pid_refs: Vec<&str> = pids.iter().map(String::as_str).collect();
+        if raise_hosting_terminal(&pid_refs, keep_existing)? {
+            return Ok(());
+        }
+        let herdr = find_herdr().ok_or_else(|| anyhow!("herdr が見つかりませんでした。"))?;
+        open_shell_in_terminal(&sh_quote(&herdr))
     }
 
     /// Show the review tmux session in Terminal.app. When a client is
@@ -414,31 +659,8 @@ impl ClaudeClient {
             .map(str::trim)
             .filter(|pid| !pid.is_empty())
             .collect();
-        if !pids.is_empty() {
-            // Terminal tabs are matched by tty. A client's own tty can differ
-            // from the tab's (shell wrappers allocate their own pty), so
-            // collect the ttys of the client process and all its ancestors,
-            // noting which terminal app hosts the client along the way.
-            let mut ttys: Vec<String> = Vec::new();
-            let mut ghostty_hosted = false;
-            for pid in &pids {
-                let info = process_tree_info(pid);
-                ghostty_hosted |= info.ghostty;
-                for tty in info.ttys {
-                    if !ttys.contains(&tty) {
-                        ttys.push(tty);
-                    }
-                }
-            }
-            if ghostty_hosted {
-                // Ghostty has no AppleScript dictionary, so the specific
-                // window cannot be selected; raising the app is best effort.
-                return activate_app("Ghostty");
-            }
-            let tty_refs: Vec<&str> = ttys.iter().map(String::as_str).collect();
-            if (!tty_refs.is_empty() && raise_terminal_window(&tty_refs)?) || keep_existing {
-                return Ok(());
-            }
+        if raise_hosting_terminal(&pids, keep_existing)? {
+            return Ok(());
         }
         open_shell_in_terminal(&format!(
             "{} attach -t {}",
@@ -576,7 +798,45 @@ fn activate_app(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// What hosts a tmux client, learned by walking up its process ancestry.
+/// Raise the terminal window hosting one of the given client processes.
+/// Returns `true` when the request is handled: a window was raised, or a
+/// client exists and `keep_existing` says to leave it alone. Returns `false`
+/// when the caller should open a new terminal instead.
+///
+/// Terminal.app tabs are matched by tty. A client's own tty can differ from
+/// the tab's (shell wrappers allocate their own pty), so the ttys of the
+/// client process and all its ancestors are collected, noting which terminal
+/// app hosts the client along the way.
+fn raise_hosting_terminal(client_pids: &[&str], keep_existing: bool) -> Result<bool> {
+    if client_pids.is_empty() {
+        return Ok(false);
+    }
+    let mut ttys: Vec<String> = Vec::new();
+    let mut ghostty_hosted = false;
+    for pid in client_pids {
+        let info = process_tree_info(pid);
+        ghostty_hosted |= info.ghostty;
+        for tty in info.ttys {
+            if !ttys.contains(&tty) {
+                ttys.push(tty);
+            }
+        }
+    }
+    if ghostty_hosted {
+        // Ghostty has no AppleScript dictionary, so the specific window
+        // cannot be selected; raising the app is best effort.
+        activate_app("Ghostty")?;
+        return Ok(true);
+    }
+    let tty_refs: Vec<&str> = ttys.iter().map(String::as_str).collect();
+    if !tty_refs.is_empty() && raise_terminal_window(&tty_refs)? {
+        return Ok(true);
+    }
+    Ok(keep_existing)
+}
+
+/// What hosts a multiplexer client, learned by walking up its process
+/// ancestry.
 #[derive(Default)]
 struct ProcessTreeInfo {
     /// ttys of the process and its ancestors (as `/dev/ttysNNN`). A shell
@@ -791,11 +1051,20 @@ mod tests {
 
     #[test]
     fn launched_record_roundtrips_through_json() {
-        let record = LaunchedRecord {
-            pane_id: "%5".to_string(),
-            window_name: "widgets#42".to_string(),
-        };
-        assert_eq!(LaunchedRecord::from_value(&record.to_value()), Some(record));
+        for backend in [LaunchBackend::Tmux, LaunchBackend::Herdr] {
+            let record = LaunchedRecord {
+                pane_id: "%5".to_string(),
+                window_name: "widgets#42".to_string(),
+                backend,
+            };
+            assert_eq!(LaunchedRecord::from_value(&record.to_value()), Some(record));
+        }
+        // Records written before herdr support default to tmux.
+        let legacy = serde_json::json!({"pane_id": "%1", "window_name": "w"});
+        assert_eq!(
+            LaunchedRecord::from_value(&legacy).map(|r| r.backend),
+            Some(LaunchBackend::Tmux)
+        );
         // Records without a pane id are dropped.
         assert_eq!(
             LaunchedRecord::from_value(&serde_json::json!({"window_name": "x"})),
