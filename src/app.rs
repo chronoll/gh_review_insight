@@ -4,8 +4,8 @@
 //! - **status**: a table of pull requests. Clicking a PR (its id or title)
 //!   opens the GitHub page in the browser. Rows can be checked and reviewed
 //!   in bulk by Claude Code: each selected PR gets an interactive `claude`
-//!   in a shared tmux session, so the run is visible and continuable like
-//!   normal terminal usage.
+//!   as a herdr tab, so the run is visible and continuable like normal
+//!   terminal usage.
 //! - **stats**: aggregated review activity for the last N days.
 //!
 //! Fetching runs on a background thread and the result is delivered over a
@@ -82,9 +82,9 @@ enum ViewState {
 
 /// Lifecycle of the Claude review for one PR (absent = not started).
 enum AiReview {
-    /// An interactive run in the tmux session; holds the pane identity used
-    /// to focus this PR's tab. Persisted and restored across app restarts
-    /// while the pane is alive.
+    /// An interactive run as a herdr tab; holds the identity used to focus
+    /// this PR's tab. Persisted and restored across app restarts while the
+    /// pane is alive.
     Launched(LaunchedRecord),
     /// A finished headless run (loaded from ai_sessions.json).
     Done(AiSessionRecord),
@@ -142,7 +142,7 @@ impl App {
             .into_iter()
             .map(|(url, record)| (url, AiReview::Done(record)))
             .collect();
-        // Live tmux runs win over older headless records for the same PR.
+        // Live herdr runs win over older headless records for the same PR.
         for (url, record) in claude::load_launched_reviews() {
             ai.insert(url, AiReview::Launched(record));
         }
@@ -262,9 +262,9 @@ impl App {
         matches!(self.ai.get(url), Some(AiReview::Launched(_)))
     }
 
-    /// Launch one interactive `claude` per selected PR in the tmux session,
-    /// then open a Terminal attached to it (unless one is already attached).
-    /// Launching is just a few tmux commands, so it runs on the UI thread.
+    /// Launch one interactive `claude` per selected PR as a herdr tab, then
+    /// show the herdr client (unless one is already visible). Launching is
+    /// just a few herdr API calls, so it runs on the UI thread.
     fn start_ai_reviews(&mut self) {
         let ViewState::Ready(Loaded::Status(prs)) = &self.state else {
             return;
@@ -301,7 +301,7 @@ impl App {
         }
     }
 
-    /// Persist the currently launched (tmux) reviews.
+    /// Persist the currently launched (herdr) reviews.
     fn save_launched(&self) {
         let launched: HashMap<String, LaunchedRecord> = self
             .ai
@@ -379,7 +379,7 @@ impl App {
                             count > 0,
                             egui::Button::new(format!("AIレビュー実行 ({count})")),
                         )
-                        .on_hover_text("選択した PR ごとに tmux 上で claude を起動（実行の様子をターミナルで確認できます）")
+                        .on_hover_text("選択した PR ごとに herdr のタブとして claude を起動（実行の様子をターミナルで確認できます）")
                         .clicked()
                     {
                         self.start_ai_reviews();
@@ -549,7 +549,7 @@ impl App {
             }
             Some(AiReview::Launched(record)) => {
                 if ui
-                    .small_button(record.backend.label())
+                    .small_button("herdr")
                     .on_hover_text("実行中。クリックでこの PR のタブを前面に表示")
                     .clicked()
                 {
