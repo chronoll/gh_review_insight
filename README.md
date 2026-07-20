@@ -74,7 +74,7 @@ status ビューで PR を選択し、まとめて Claude Code にレビュー�
 
 - herdr が必要です（`brew install herdr`）。
 - 実行ディレクトリは `$HOME/.config/gh-review-insight/workspace/` 固定です。初回はこのフォルダの信頼確認が claude 側で表示されるので承認してください（一度だけ）。
-- **検証モード**: 本来のレビュースキル（`/gh-review:review`）は subagent を大量に使いトークン消費が激しく、複数 PR の同時実行でレートリミットに達しやすいため、現在は呼び出し経路の検証用に即答する軽量プロンプトを送ります。本来のプロンプトに戻すには `src/claude.rs` の `review_prompt` のコメントを入れ替えてください。
+- プロンプトとして PR の URL のみを送ります。レビューは claude 側の pr-review スキルが URL を受けて発火します（プロンプトを変えたい場合は `src/claude.rs` の `review_prompt`）。
 - レビュータブはアプリを終了しても残ります（herdr サーバーが保持）。claude を exit すればタブは閉じます。
 - 過去のヘッドレス実行で保存されたレポート・セッションがある場合は、AI 列の「結果」「続き」ボタンから引き続き利用できます。
 

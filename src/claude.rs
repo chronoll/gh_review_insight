@@ -70,15 +70,10 @@ fn augmented_path() -> String {
 /// gh-review skill's `allowed-tools` plus the orchestration tools.
 const REVIEW_ALLOWED_TOOLS: &str = "Bash,Glob,Grep,Read,Agent,Task,TodoWrite,Skill";
 
-/// The prompt sent to `claude` for one PR.
-///
-/// 検証モード: 本来は `/gh-review:review <URL>` を送るが、レビュースキルは
-/// subagent を大量に起動しトークン消費が激しい（複数 PR 同時実行でレート
-/// リミットに達した実績あり）ため、呼び出し経路の検証が済むまで即答する
-/// 軽量プロンプトに差し替えている。戻すときは下の行を入れ替える。
+/// The prompt sent to `claude` for one PR: the PR URL そのもの。レビューは
+/// pr-review スキルが URL を受けて発火する。
 fn review_prompt(pr_url: &str) -> String {
-    format!("接続テストです。ツールを使わず「{pr_url} のレビュー依頼を受け付けました」とだけ一行で返答してください。")
-    // 本来: format!("/gh-review:review {pr_url}")
+    pr_url.to_string()
 }
 
 /// herdr workspace that hosts the review tabs.
@@ -906,9 +901,11 @@ mod tests {
     }
 
     #[test]
-    fn review_prompt_embeds_the_pr_url() {
-        let prompt = review_prompt("https://github.com/acme/widgets/pull/42");
-        assert!(prompt.contains("https://github.com/acme/widgets/pull/42"));
+    fn review_prompt_is_the_pr_url() {
+        assert_eq!(
+            review_prompt("https://github.com/acme/widgets/pull/42"),
+            "https://github.com/acme/widgets/pull/42"
+        );
     }
 
     #[test]
