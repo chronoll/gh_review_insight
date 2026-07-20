@@ -324,6 +324,91 @@ pub fn save_launched_reviews(launched: &HashMap<String, LaunchedRecord>) {
     }
 }
 
+/// Directory where the pr-review skill writes HTML reports, as
+/// `<repo>/<PR番号>-<YYYYMMDD>-<HHMMSS>.html`.
+fn review_logs_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".claude/pr-review-logs"))
+}
+
+/// A review report on disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewReport {
+    /// Full path of the HTML file.
+    pub path: String,
+    /// Short timestamp label for the button (e.g. `07/20 13:22`).
+    pub label: String,
+}
+
+/// All review reports on disk, keyed by `repo#番号` (the GUI's short PR id).
+/// A PR can have multiple reports; they are ordered newest first.
+pub fn load_review_reports() -> HashMap<String, Vec<ReviewReport>> {
+    let Some(root) = review_logs_dir() else {
+        return HashMap::new();
+    };
+    let Ok(repos) = std::fs::read_dir(&root) else {
+        return HashMap::new();
+    };
+    let mut map: HashMap<String, Vec<(String, ReviewReport)>> = HashMap::new();
+    for repo_entry in repos.flatten() {
+        let repo_dir = repo_entry.path();
+        if !repo_dir.is_dir() {
+            continue;
+        }
+        let repo = repo_entry.file_name().to_string_lossy().into_owned();
+        let Ok(files) = std::fs::read_dir(&repo_dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("html") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Some((number, label)) = parse_report_stem(stem) else {
+                continue;
+            };
+            map.entry(format!("{repo}#{number}")).or_default().push((
+                stem.to_string(),
+                ReviewReport {
+                    path: path.to_string_lossy().into_owned(),
+                    label,
+                },
+            ));
+        }
+    }
+    map.into_iter()
+        .map(|(key, mut reports)| {
+            // The zero-padded timestamp makes filename order chronological.
+            reports.sort_by(|a, b| b.0.cmp(&a.0));
+            (key, reports.into_iter().map(|(_, report)| report).collect())
+        })
+        .collect()
+}
+
+/// `12358-20260720-132207` -> the PR number and a short timestamp label
+/// (`07/20 13:22`). None when the stem doesn't start with a PR number.
+fn parse_report_stem(stem: &str) -> Option<(&str, String)> {
+    let (number, timestamp) = stem.split_once('-')?;
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let label = match (
+        timestamp.get(4..6),
+        timestamp.get(6..8),
+        timestamp.get(9..11),
+        timestamp.get(11..13),
+    ) {
+        (Some(month), Some(day), Some(hour), Some(minute)) => {
+            format!("{month}/{day} {hour}:{minute}")
+        }
+        _ => timestamp.to_string(),
+    };
+    Some((number, label))
+}
+
 /// Load persisted review sessions, keyed by PR URL.
 pub fn load_sessions() -> HashMap<String, AiSessionRecord> {
     let Some(path) = config::ai_sessions_path() else {
@@ -824,6 +909,19 @@ mod tests {
     fn review_prompt_embeds_the_pr_url() {
         let prompt = review_prompt("https://github.com/acme/widgets/pull/42");
         assert!(prompt.contains("https://github.com/acme/widgets/pull/42"));
+    }
+
+    #[test]
+    fn report_stem_yields_pr_number_and_label() {
+        assert_eq!(
+            parse_report_stem("12358-20260720-132207"),
+            Some(("12358", "07/20 13:22".to_string()))
+        );
+        // Unexpected timestamp shapes fall back to the raw text.
+        assert_eq!(parse_report_stem("7-x"), Some(("7", "x".to_string())));
+        // Files not starting with a PR number are skipped.
+        assert_eq!(parse_report_stem("_general"), None);
+        assert_eq!(parse_report_stem("notes-20260720"), None);
     }
 
     #[test]

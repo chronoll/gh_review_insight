@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use crate::claude::{self, AiSessionRecord, ClaudeClient, LaunchedRecord};
+use crate::claude::{self, AiSessionRecord, ClaudeClient, LaunchedRecord, ReviewReport};
 use crate::config::{colors_path, excludes_path, ignored_path, load_colors, load_excludes, load_ignored};
 
 use eframe::egui;
@@ -134,6 +134,9 @@ pub struct App {
     selected: HashSet<String>,
     /// AI review state per PR URL. Persisted `Done` entries survive restarts.
     ai: HashMap<String, AiReview>,
+    /// Review reports on disk, keyed by `repo#番号`, newest first. Rescanned
+    /// on every status reload.
+    reports: HashMap<String, Vec<ReviewReport>>,
 }
 
 impl App {
@@ -168,6 +171,7 @@ impl App {
             claude_path: "claude".to_string(),
             selected: HashSet::new(),
             ai,
+            reports: claude::load_review_reports(),
         }
     }
 
@@ -227,6 +231,11 @@ impl App {
                 match result {
                     Ok((login, loaded)) => {
                         self.login = login;
+                        if matches!(loaded, Loaded::Status(_)) {
+                            // Reports may have been written since the last
+                            // reload; rescan alongside the PR data.
+                            self.reports = claude::load_review_reports();
+                        }
                         self.state = ViewState::Ready(loaded);
                     }
                     Err(message) => self.state = ViewState::Error(message),
@@ -447,10 +456,11 @@ impl App {
             .column(Column::auto().at_least(80.0).at_most(220.0).clip(true)) // requested
             .column(Column::auto()) // updated
             .column(Column::auto()) // AI
+            .column(Column::auto()) // report
             .header(20.0, |mut header| {
                 for label in [
                     "選択", "status", "PR", "author", "title", "mine", "others", "requested",
-                    "updated", "AI",
+                    "updated", "AI", "report",
                 ] {
                     header.col(|ui| {
                         ui.strong(label);
@@ -535,9 +545,38 @@ impl App {
                             fill_cell(ui, tint);
                             self.ai_cell(ui, pr, actions);
                         });
+                        row.col(|ui| {
+                            fill_cell(ui, tint);
+                            self.reports_cell(ui, pr, actions);
+                        });
                     });
                 }
             });
+    }
+
+    /// The "report" column: one button per review report found on disk for
+    /// this PR (newest first), opening the HTML in the browser.
+    fn reports_cell(&self, ui: &mut egui::Ui, pr: &PullRequestSummary, actions: &mut TableActions) {
+        let reports = self.reports.get(&pr_short(pr));
+        match reports {
+            Some(reports) if !reports.is_empty() => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for report in reports {
+                        if ui
+                            .small_button(&report.label)
+                            .on_hover_text(format!("レビューレポートを開く\n{}", report.path))
+                            .clicked()
+                        {
+                            actions.open_report = Some(report.path.clone());
+                        }
+                    }
+                });
+            }
+            _ => {
+                ui.label("-");
+            }
+        }
     }
 
     /// The "AI" column: current review state, with the report / resume
