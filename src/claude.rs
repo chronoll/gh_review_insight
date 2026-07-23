@@ -525,11 +525,79 @@ pub fn save_sessions(sessions: &HashMap<String, AiSessionRecord>) {
 
 /// Open the saved review report with the default application.
 pub fn open_report(path: &str) -> Result<()> {
+    if let Some(browser_app) = default_browser_app() {
+        let script = open_new_window_script(&browser_app, &file_url(path));
+        let opened = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if opened {
+            return Ok(());
+        }
+    }
+    // Fallback: the OS default handler for the file. Always works, but may
+    // reuse an existing window/tab rather than opening a fresh one.
     Command::new("open")
         .arg(path)
         .spawn()
         .context("レビュー結果を開けませんでした")?;
     Ok(())
+}
+
+/// The user's default web browser's `.app` bundle path — whatever `open
+/// https://…` would launch — found via `NSWorkspace` since browsers vary
+/// widely in what CLI flags or AppleScript they support for opening a URL.
+fn default_browser_app() -> Option<String> {
+    let script = r#"use framework "AppKit"
+use scripting additions
+set theURL to current application's NSURL's URLWithString:"https://example.com"
+set appURL to current application's NSWorkspace's sharedWorkspace's URLForApplicationToOpenURL:theURL
+return appURL's |path| as text"#;
+    let output = Command::new("osascript").arg("-e").arg(script).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!path.is_empty()).then_some(path)
+}
+
+/// AppleScript that opens `url` as a brand-new window in `browser_app` (an
+/// absolute `.app` path, so this works regardless of display name). Safari's
+/// `make new document` always creates a new window; other browsers use the
+/// window/tab AppleScript dictionary Chromium itself provides (Chrome,
+/// Brave, Edge, Vivaldi, Opera, … — any fork that hasn't removed it).
+/// Browsers without that dictionary (e.g. Arc) make the whole `osascript`
+/// call fail, which `open_report` falls back on.
+fn open_new_window_script(browser_app: &str, url: &str) -> String {
+    let app = applescript_escape(browser_app);
+    let url = applescript_escape(url);
+    if browser_app.ends_with("/Safari.app") {
+        format!(
+            "tell application \"{app}\"\nmake new document with properties {{URL:\"{url}\"}}\nend tell"
+        )
+    } else {
+        format!(
+            "tell application \"{app}\"\nset newWin to make new window\nset URL of active tab of newWin to \"{url}\"\nend tell"
+        )
+    }
+}
+
+/// Percent-encode a filesystem path into a `file://` URL. Spaces and other
+/// reserved/non-ASCII bytes need encoding; `/` stays literal as the path
+/// separator.
+fn file_url(path: &str) -> String {
+    let mut url = String::from("file://");
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                url.push(byte as char);
+            }
+            _ => url.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    url
 }
 
 /// Thin wrapper around the `claude` CLI.
@@ -1003,6 +1071,24 @@ mod tests {
             review_prompt("https://github.com/acme/widgets/pull/42"),
             "https://github.com/acme/widgets/pull/42"
         );
+    }
+
+    #[test]
+    fn file_url_percent_encodes_unsafe_bytes_but_keeps_slashes() {
+        assert_eq!(
+            file_url("/Users/michika kurotaka/日報.html"),
+            "file:///Users/michika%20kurotaka/%E6%97%A5%E5%A0%B1.html"
+        );
+    }
+
+    #[test]
+    fn open_new_window_script_special_cases_safari() {
+        let safari = open_new_window_script("/Applications/Safari.app", "file:///a.html");
+        assert!(safari.contains("make new document with properties"));
+
+        let chrome = open_new_window_script("/Applications/Google Chrome.app", "file:///a.html");
+        assert!(chrome.contains("make new window"));
+        assert!(chrome.contains("active tab"));
     }
 
     #[test]
