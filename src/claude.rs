@@ -140,6 +140,56 @@ fn ensure_herdr_workspace(cwd: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("herdr workspace create の応答から id を取得できませんでした。"))
 }
 
+/// Start `argv` as a herdr agent in the dedicated review workspace, moved
+/// into its own tab labeled `window_name` (one tab per PR). Returns the new
+/// tab's terminal id, used to focus it later.
+fn spawn_herdr_tab(window_name: &str, argv: &[&str]) -> Result<String> {
+    let workspace = workspace_dir()?;
+    std::fs::create_dir_all(&workspace)
+        .context("workspace ディレクトリを作成できませんでした")?;
+    let cwd = workspace.to_string_lossy().into_owned();
+    let ws_id = ensure_herdr_workspace(&cwd)?;
+
+    let mut args = vec![
+        "agent", "start", window_name, "--workspace", &ws_id, "--cwd", &cwd, "--no-focus", "--",
+    ];
+    args.extend_from_slice(argv);
+    let started = herdr_run(&args)?;
+    let agent = &started["agent"];
+    let terminal_id = agent["terminal_id"].as_str().unwrap_or("").to_string();
+    let pane_id = agent["pane_id"].as_str().unwrap_or("").to_string();
+    if terminal_id.is_empty() || pane_id.is_empty() {
+        return Err(anyhow!("herdr agent start の応答から id を取得できませんでした。"));
+    }
+    // `agent start` splits into the workspace's active tab; give the run its
+    // own labeled tab. The label doubles as the identity check used by the
+    // liveness filter, so a failure here is a real error.
+    herdr_run(&[
+        "pane", "move", &pane_id, "--new-tab", "--workspace", &ws_id, "--label", window_name,
+        "--no-focus",
+    ])?;
+    Ok(terminal_id)
+}
+
+/// Generate a UUID for a new claude session via macOS's `uuidgen`. Passed to
+/// `claude --session-id` so the id is known up front — an interactive run
+/// prints no machine-readable session line, so this is the only way to learn
+/// it before (or without) tearing the tab down.
+fn generate_session_id() -> Result<String> {
+    let output = Command::new("uuidgen")
+        .env("PATH", augmented_path())
+        .output()
+        .map_err(|err| anyhow!("uuidgen を実行できませんでした: {err}"))?;
+    if !output.status.success() {
+        return Err(anyhow!("uuidgen が失敗しました。"));
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+    if id.is_empty() {
+        return Err(anyhow!("uuidgen が空の出力を返しました。"));
+    }
+    Ok(id)
+}
+
 /// The live review panes in the herdr workspace: terminal id -> label.
 /// Empty when herdr (or its server) is not running — panes are dead then.
 fn live_herdr_reviews() -> HashMap<String, String> {
@@ -236,6 +286,12 @@ pub struct LaunchedRecord {
     /// The tab name the run was created with (`repo#42`), double-checking
     /// identity in case ids are ever reused.
     pub window_name: String,
+    /// claude session id, assigned up front via `--session-id` (an
+    /// interactive run has no machine-readable way to report its id
+    /// otherwise). Lets the conversation be resumed in a fresh tab if this
+    /// one's herdr pane disappears, e.g. after a reboot restarts herdr.
+    /// Empty for records written before this field existed.
+    pub session_id: String,
 }
 
 impl LaunchedRecord {
@@ -243,6 +299,7 @@ impl LaunchedRecord {
         serde_json::json!({
             "pane_id": self.pane_id,
             "window_name": self.window_name,
+            "session_id": self.session_id,
             "backend": "herdr",
         })
     }
@@ -260,26 +317,40 @@ impl LaunchedRecord {
         Some(Self {
             pane_id,
             window_name: value["window_name"].as_str().unwrap_or("").to_string(),
+            session_id: value["session_id"].as_str().unwrap_or("").to_string(),
         })
     }
 }
 
-/// Load persisted launched reviews, keeping only entries whose herdr pane is
-/// still alive with the expected tab name. The file is rewritten when stale
-/// entries were dropped.
-pub fn load_launched_reviews() -> HashMap<String, LaunchedRecord> {
+/// Load persisted launched reviews. Returns `(record, is_live)` per PR URL:
+/// `is_live` says whether the herdr pane is actually running right now.
+/// Entries whose pane is dead AND have no session id (nothing to resume,
+/// e.g. written before session-id tracking existed) are dropped and the
+/// file is rewritten; everything else is kept indefinitely so a resumable
+/// session survives a herdr restart until it's resumed or overwritten by a
+/// fresh run.
+pub fn load_launched_reviews() -> HashMap<String, (LaunchedRecord, bool)> {
     let all = read_launched();
     if all.is_empty() {
-        return all;
+        return HashMap::new();
     }
     let live = live_herdr_reviews();
-    let kept: HashMap<String, LaunchedRecord> = all
-        .iter()
-        .filter(|(_, record)| live.get(&record.pane_id) == Some(&record.window_name))
-        .map(|(url, record)| (url.clone(), record.clone()))
-        .collect();
-    if kept.len() != all.len() {
-        save_launched_reviews(&kept);
+    let mut kept: HashMap<String, (LaunchedRecord, bool)> = HashMap::new();
+    let mut pruned = false;
+    for (url, record) in all {
+        let is_live = live.get(&record.pane_id) == Some(&record.window_name);
+        if is_live || !record.session_id.is_empty() {
+            kept.insert(url, (record, is_live));
+        } else {
+            pruned = true;
+        }
+    }
+    if pruned {
+        let to_save: HashMap<String, LaunchedRecord> = kept
+            .iter()
+            .map(|(url, (record, _))| (url.clone(), record.clone()))
+            .collect();
+        save_launched_reviews(&to_save);
     }
     kept
 }
@@ -465,39 +536,35 @@ impl ClaudeClient {
 
     /// Start an interactive `claude` for one PR as a herdr agent in the
     /// dedicated review workspace, moved into its own labeled tab (one tab
-    /// per PR). Returns quickly with the run's identity (used to focus its
-    /// tab later); the review itself keeps running in its tab.
+    /// per PR). A session id is assigned up front (`--session-id`) so the
+    /// conversation can be resumed later even if this tab disappears.
+    /// Returns quickly with the run's identity (used to focus its tab
+    /// later); the review itself keeps running in its tab.
     pub fn launch_review(&self, pr_url: &str, pr_key: &str) -> Result<LaunchedRecord> {
-        let workspace = workspace_dir()?;
-        std::fs::create_dir_all(&workspace)
-            .context("workspace ディレクトリを作成できませんでした")?;
-        let cwd = workspace.to_string_lossy().into_owned();
-        let ws_id = ensure_herdr_workspace(&cwd)?;
-        let window_name = pr_key.rsplit('/').next().unwrap_or(pr_key);
+        let window_name = pr_key.rsplit('/').next().unwrap_or(pr_key).to_string();
         let claude = resolve_claude(&self.claude_path);
         let prompt = review_prompt(pr_url);
+        let session_id = generate_session_id()?;
 
-        let started = herdr_run(&[
-            "agent", "start", window_name, "--workspace", &ws_id, "--cwd", &cwd, "--no-focus",
-            "--", &claude, &prompt,
-        ])?;
-        let agent = &started["agent"];
-        let terminal_id = agent["terminal_id"].as_str().unwrap_or("").to_string();
-        let pane_id = agent["pane_id"].as_str().unwrap_or("").to_string();
-        if terminal_id.is_empty() || pane_id.is_empty() {
-            return Err(anyhow!("herdr agent start の応答から id を取得できませんでした。"));
-        }
-        // `agent start` splits into the workspace's active tab; give the run
-        // its own labeled tab. The label doubles as the identity check used
-        // by the liveness filter, so a failure here is a real error.
-        herdr_run(&[
-            "pane", "move", &pane_id, "--new-tab", "--workspace", &ws_id, "--label", window_name,
-            "--no-focus",
-        ])?;
-
+        let pane_id = spawn_herdr_tab(&window_name, &[&claude, "--session-id", &session_id, &prompt])?;
         Ok(LaunchedRecord {
-            pane_id: terminal_id,
-            window_name: window_name.to_string(),
+            pane_id,
+            window_name,
+            session_id,
+        })
+    }
+
+    /// Reopen a review whose herdr tab is gone as a fresh tab running
+    /// `claude --resume <session_id>`, continuing the same conversation
+    /// (same session id; herdr restarting is what killed the old tab, not
+    /// the underlying transcript, which claude keeps on disk regardless).
+    pub fn resume_review(&self, record: &LaunchedRecord) -> Result<LaunchedRecord> {
+        let claude = resolve_claude(&self.claude_path);
+        let pane_id = spawn_herdr_tab(&record.window_name, &[&claude, "--resume", &record.session_id])?;
+        Ok(LaunchedRecord {
+            pane_id,
+            window_name: record.window_name.clone(),
+            session_id: record.session_id.clone(),
         })
     }
 
@@ -926,6 +993,7 @@ mod tests {
         let record = LaunchedRecord {
             pane_id: "term_abc123".to_string(),
             window_name: "widgets#42".to_string(),
+            session_id: "8b654f7f-042e-413e-9232-b7e0c9eba66b".to_string(),
         };
         assert_eq!(LaunchedRecord::from_value(&record.to_value()), Some(record));
         // Records from the retired tmux backend (no backend tag) are dropped.
@@ -935,6 +1003,14 @@ mod tests {
         assert_eq!(
             LaunchedRecord::from_value(&serde_json::json!({"window_name": "x", "backend": "herdr"})),
             None
+        );
+        // Records written before session-id tracking default to empty.
+        let pre_feature = serde_json::json!({
+            "pane_id": "term_x", "window_name": "w", "backend": "herdr",
+        });
+        assert_eq!(
+            LaunchedRecord::from_value(&pre_feature).map(|r| r.session_id),
+            Some(String::new())
         );
     }
 

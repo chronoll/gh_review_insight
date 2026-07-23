@@ -86,6 +86,10 @@ enum AiReview {
     /// this PR's tab. Persisted and restored across app restarts while the
     /// pane is alive.
     Launched(LaunchedRecord),
+    /// The herdr tab is gone (e.g. herdr restarted after a reboot), but the
+    /// claude session id is known, so the conversation can be reopened in a
+    /// new tab.
+    Resumable(LaunchedRecord),
     /// A finished headless run (loaded from ai_sessions.json).
     Done(AiSessionRecord),
     Failed(String),
@@ -99,10 +103,12 @@ struct TableActions {
     toggle: Vec<String>,
     /// Report file to open.
     open_report: Option<String>,
-    /// Session id to resume in Terminal.
+    /// Session id to resume in Terminal (headless flow).
     resume: Option<String>,
     /// Launched run whose tab should be focused and brought to the front.
     focus: Option<LaunchedRecord>,
+    /// (PR url, record) whose herdr tab is gone and should be reopened.
+    resume_herdr: Option<(String, LaunchedRecord)>,
 }
 
 pub struct App {
@@ -145,9 +151,15 @@ impl App {
             .into_iter()
             .map(|(url, record)| (url, AiReview::Done(record)))
             .collect();
-        // Live herdr runs win over older headless records for the same PR.
-        for (url, record) in claude::load_launched_reviews() {
-            ai.insert(url, AiReview::Launched(record));
+        // Live (or resumable) herdr runs win over older headless records
+        // for the same PR.
+        for (url, (record, is_live)) in claude::load_launched_reviews() {
+            let state = if is_live {
+                AiReview::Launched(record)
+            } else {
+                AiReview::Resumable(record)
+            };
+            ai.insert(url, state);
         }
         Self {
             gh_path,
@@ -310,13 +322,15 @@ impl App {
         }
     }
 
-    /// Persist the currently launched (herdr) reviews.
+    /// Persist the currently launched/resumable (herdr) reviews.
     fn save_launched(&self) {
         let launched: HashMap<String, LaunchedRecord> = self
             .ai
             .iter()
             .filter_map(|(url, state)| match state {
-                AiReview::Launched(record) => Some((url.clone(), record.clone())),
+                AiReview::Launched(record) | AiReview::Resumable(record) => {
+                    Some((url.clone(), record.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -344,6 +358,21 @@ impl App {
             let client = ClaudeClient::new(self.claude_path.clone());
             if let Err(err) = client.focus_review_window(&record) {
                 eprintln!("warning: {err:#}");
+            }
+        }
+        if let Some((url, record)) = actions.resume_herdr {
+            let client = ClaudeClient::new(self.claude_path.clone());
+            match client.resume_review(&record) {
+                Ok(new_record) => {
+                    self.ai.insert(url, AiReview::Launched(new_record));
+                    self.save_launched();
+                    if let Err(err) = client.show_review_terminal(false) {
+                        eprintln!("warning: {err:#}");
+                    }
+                }
+                Err(err) => {
+                    self.ai.insert(url, AiReview::Failed(format!("{err:#}")));
+                }
             }
         }
     }
@@ -593,6 +622,17 @@ impl App {
                     .clicked()
                 {
                     actions.focus = Some(record.clone());
+                }
+            }
+            Some(AiReview::Resumable(record)) => {
+                if ui
+                    .small_button("続き")
+                    .on_hover_text(
+                        "herdr の再起動などでタブが消えましたが、会話は保存されているので新しいタブで再開できます",
+                    )
+                    .clicked()
+                {
+                    actions.resume_herdr = Some((pr.url.clone(), record.clone()));
                 }
             }
             Some(AiReview::Done(record)) => {
