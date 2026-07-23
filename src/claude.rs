@@ -76,6 +76,16 @@ fn review_prompt(pr_url: &str) -> String {
     pr_url.to_string()
 }
 
+/// The prompt sent when re-reviewing a PR that was re-requested after a
+/// prior AI review. Sent as the next turn of that review's own session (via
+/// `--resume`), so claude keeps the context of what it already flagged and
+/// can focus on what changed since.
+fn re_review_prompt(pr_url: &str) -> String {
+    format!(
+        "{pr_url} が再リクエストされました。前回のレビュー以降の差分に注目してレビューしてください。"
+    )
+}
+
 /// herdr workspace that hosts the review tabs.
 const HERDR_WORKSPACE_LABEL: &str = "gh-review";
 
@@ -558,9 +568,29 @@ impl ClaudeClient {
     /// `claude --resume <session_id>`, continuing the same conversation
     /// (same session id; herdr restarting is what killed the old tab, not
     /// the underlying transcript, which claude keeps on disk regardless).
+    /// No new message is sent — this just re-opens the existing conversation.
     pub fn resume_review(&self, record: &LaunchedRecord) -> Result<LaunchedRecord> {
+        self.continue_review(record, None)
+    }
+
+    /// Re-review a PR that was re-requested after a prior AI review: resumes
+    /// that review's session (same session id, new tab) and immediately
+    /// sends a prompt asking claude to focus on what changed since, using
+    /// its own memory of the earlier review as the baseline.
+    pub fn launch_re_review(&self, pr_url: &str, record: &LaunchedRecord) -> Result<LaunchedRecord> {
+        self.continue_review(record, Some(&re_review_prompt(pr_url)))
+    }
+
+    /// Shared implementation for `resume_review` / `launch_re_review`: opens
+    /// a new tab running `claude --resume <session_id>`, optionally with an
+    /// extra argument that claude processes as the next turn.
+    fn continue_review(&self, record: &LaunchedRecord, prompt: Option<&str>) -> Result<LaunchedRecord> {
         let claude = resolve_claude(&self.claude_path);
-        let pane_id = spawn_herdr_tab(&record.window_name, &[&claude, "--resume", &record.session_id])?;
+        let mut argv = vec![claude.as_str(), "--resume", record.session_id.as_str()];
+        if let Some(prompt) = prompt {
+            argv.push(prompt);
+        }
+        let pane_id = spawn_herdr_tab(&record.window_name, &argv)?;
         Ok(LaunchedRecord {
             pane_id,
             window_name: record.window_name.clone(),
@@ -973,6 +1003,13 @@ mod tests {
             review_prompt("https://github.com/acme/widgets/pull/42"),
             "https://github.com/acme/widgets/pull/42"
         );
+    }
+
+    #[test]
+    fn re_review_prompt_mentions_re_request_and_the_url() {
+        let prompt = re_review_prompt("https://github.com/acme/widgets/pull/42");
+        assert!(prompt.contains("https://github.com/acme/widgets/pull/42"));
+        assert!(prompt.contains("再リクエスト"));
     }
 
     #[test]

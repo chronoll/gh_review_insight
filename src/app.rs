@@ -271,7 +271,7 @@ impl App {
                     ReviewStatus::RequestedUntouched | ReviewStatus::RequestedOthersReviewed
                 )
             })
-            .filter(|pr| !self.is_launched(&pr.url))
+            .filter(|pr| !self.blocks_selection(pr))
             .map(|pr| pr.url.clone())
             .collect();
         self.selected.extend(urls);
@@ -283,18 +283,45 @@ impl App {
         matches!(self.ai.get(url), Some(AiReview::Launched(_)))
     }
 
+    /// The prior review to continue when re-reviewing this PR: `Some` only
+    /// when it was re-requested for review (`RequestedUntouched`) and we
+    /// have a session to resume from an earlier AI review (Launched or
+    /// Resumable both carry one). Checked regardless of the current tab's
+    /// liveness, since resuming — not the tab surviving — is what carries
+    /// claude's memory of the earlier review forward.
+    fn re_review_target(&self, pr: &PullRequestSummary) -> Option<LaunchedRecord> {
+        if pr.review_status() != ReviewStatus::RequestedUntouched {
+            return None;
+        }
+        match self.ai.get(&pr.url) {
+            Some(AiReview::Launched(record)) | Some(AiReview::Resumable(record)) => {
+                Some(record.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// True when selecting this PR for a new AI review should be disallowed:
+    /// a tab is already running AND it isn't a fresh re-request (re-requests
+    /// always get to re-review, even while the old tab is still open).
+    fn blocks_selection(&self, pr: &PullRequestSummary) -> bool {
+        self.is_launched(&pr.url) && self.re_review_target(pr).is_none()
+    }
+
     /// Launch one interactive `claude` per selected PR as a herdr tab, then
-    /// show the herdr client (unless one is already visible). Launching is
-    /// just a few herdr API calls, so it runs on the UI thread.
+    /// show the herdr client (unless one is already visible). PRs that were
+    /// re-requested after a prior AI review resume that review's session
+    /// with a re-request prompt instead of starting a brand-new one.
+    /// Launching is just a few herdr API calls, so it runs on the UI thread.
     fn start_ai_reviews(&mut self) {
         let ViewState::Ready(Loaded::Status(prs)) = &self.state else {
             return;
         };
-        let targets: Vec<(String, String)> = prs
+        let targets: Vec<(String, String, Option<LaunchedRecord>)> = prs
             .iter()
             .filter(|pr| self.selected.contains(&pr.url))
-            .filter(|pr| !self.is_launched(&pr.url))
-            .map(|pr| (pr.url.clone(), pr.pr_key()))
+            .filter(|pr| !self.blocks_selection(pr))
+            .map(|pr| (pr.url.clone(), pr.pr_key(), self.re_review_target(pr)))
             .collect();
         if targets.is_empty() {
             return;
@@ -302,9 +329,13 @@ impl App {
 
         let client = ClaudeClient::new(self.claude_path.clone());
         let mut launched_any = false;
-        for (url, pr_key) in targets {
+        for (url, pr_key, prior) in targets {
             self.selected.remove(&url);
-            match client.launch_review(&url, &pr_key) {
+            let result = match &prior {
+                Some(record) => client.launch_re_review(&url, record),
+                None => client.launch_review(&url, &pr_key),
+            };
+            match result {
                 Ok(record) => {
                     self.ai.insert(url, AiReview::Launched(record));
                     launched_any = true;
@@ -502,15 +533,22 @@ impl App {
                     body.row(24.0, |mut row| {
                         row.col(|ui| {
                             fill_cell(ui, tint);
-                            let launched = self.is_launched(&pr.url);
-                            let mut checked = !launched && self.selected.contains(&pr.url);
-                            if ui
-                                .add_enabled(!launched, egui::Checkbox::without_text(&mut checked))
-                                .on_disabled_hover_text(
+                            let blocked = self.blocks_selection(pr);
+                            let mut checked = !blocked && self.selected.contains(&pr.url);
+                            let response =
+                                ui.add_enabled(!blocked, egui::Checkbox::without_text(&mut checked));
+                            let response = if blocked {
+                                response.on_disabled_hover_text(
                                     "実行中のレビュータブがあるため選択できません",
                                 )
-                                .changed()
-                            {
+                            } else if self.re_review_target(pr).is_some() {
+                                response.on_hover_text(
+                                    "再リクエストされています。実行すると前回のセッションを継続し、差分に注目してレビューします",
+                                )
+                            } else {
+                                response
+                            };
+                            if response.changed() {
                                 actions.toggle.push(pr.url.clone());
                             }
                         });
