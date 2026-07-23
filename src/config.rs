@@ -37,6 +37,12 @@ pub fn workspace_dir() -> Option<PathBuf> {
     Some(config_dir()?.join("workspace"))
 }
 
+/// Identity of the dedicated browser window review reports are opened into
+/// (so repeated opens land as tabs in the same window).
+pub fn review_browser_window_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("review_browser_window.json"))
+}
+
 pub fn load_colors() -> HashMap<String, [u8; 3]> {
     colors_path()
         .and_then(|path| std::fs::read_to_string(path).ok())

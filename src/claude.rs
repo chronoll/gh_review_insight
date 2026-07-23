@@ -523,22 +523,18 @@ pub fn save_sessions(sessions: &HashMap<String, AiSessionRecord>) {
     }
 }
 
-/// Open the saved review report with the default application.
+/// Open the saved review report as a tab in a dedicated "review window" in
+/// the default browser, reusing the same window across calls (mirrors the
+/// herdr tab consolidation used for reviews themselves) so reports pile up
+/// as tabs instead of scattering across new windows.
 pub fn open_report(path: &str) -> Result<()> {
     if let Some(browser_app) = default_browser_app() {
-        let script = open_new_window_script(&browser_app, &file_url(path));
-        let opened = Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-        if opened {
+        if open_in_review_window(&browser_app, &file_url(path)) {
             return Ok(());
         }
     }
-    // Fallback: the OS default handler for the file. Always works, but may
-    // reuse an existing window/tab rather than opening a fresh one.
+    // Fallback: the OS default handler for the file. Always works, but
+    // doesn't control which window/tab it lands in.
     Command::new("open")
         .arg(path)
         .spawn()
@@ -563,25 +559,163 @@ return appURL's |path| as text"#;
     (!path.is_empty()).then_some(path)
 }
 
-/// AppleScript that opens `url` as a brand-new window in `browser_app` (an
-/// absolute `.app` path, so this works regardless of display name). Safari's
-/// `make new document` always creates a new window; other browsers use the
-/// window/tab AppleScript dictionary Chromium itself provides (Chrome,
-/// Brave, Edge, Vivaldi, Opera, … — any fork that hasn't removed it).
-/// Browsers without that dictionary (e.g. Arc) make the whole `osascript`
-/// call fail, which `open_report` falls back on.
-fn open_new_window_script(browser_app: &str, url: &str) -> String {
+/// Identity of the dedicated review window, persisted so it survives this
+/// app restarting (the window itself lives in the browser process, which
+/// keeps running independently).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReviewWindowRecord {
+    /// The default browser this window belongs to. A window id found under
+    /// a different browser would be meaningless (ids aren't shared across
+    /// apps) or could even collide with an unrelated window.
+    browser_app: String,
+    /// AppleScript window id — session-scoped, valid only as long as the
+    /// browser process and that specific window are still alive.
+    window_id: i64,
+}
+
+fn load_review_window() -> Option<ReviewWindowRecord> {
+    let path = config::review_browser_window_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    Some(ReviewWindowRecord {
+        browser_app: value["browser_app"].as_str()?.to_string(),
+        window_id: value["window_id"].as_i64()?,
+    })
+}
+
+fn save_review_window(record: &ReviewWindowRecord) {
+    let Some(path) = config::review_browser_window_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let value = serde_json::json!({
+        "browser_app": record.browser_app,
+        "window_id": record.window_id,
+    });
+    if let Ok(json) = serde_json::to_string_pretty(&value) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Open `url` as a tab in the dedicated review window for `browser_app`,
+/// creating that window on first use (or after the previous one was closed,
+/// or the default browser changed) and reusing it otherwise. Returns false
+/// when the browser can't be driven this way at all (e.g. Arc has no
+/// AppleScript window/tab dictionary — every attempt below fails the same
+/// way), letting the caller fall back to the OS default handler.
+fn open_in_review_window(browser_app: &str, url: &str) -> bool {
+    ensure_browser_running(browser_app);
+
+    if let Some(record) = load_review_window() {
+        if record.browser_app == browser_app
+            && run_applescript(&add_tab_script(browser_app, record.window_id, url))
+        {
+            return true;
+        }
+        // Either a different browser is now default, or the window is gone
+        // (closed, or the browser itself restarted) — fall through to open
+        // a fresh one below.
+    }
+
+    let Some(window_id) = create_window_and_get_id(browser_app, url) else {
+        return false;
+    };
+    save_review_window(&ReviewWindowRecord {
+        browser_app: browser_app.to_string(),
+        window_id,
+    });
+    true
+}
+
+/// Launch `browser_app` if it isn't already running, and give it a moment to
+/// finish starting. Chrome (and likely other Chromium forks) restores the
+/// previous session into whatever window it creates first after a cold
+/// start; starting it ourselves first, ahead of `create_window_and_get_id`,
+/// keeps that restore out of our dedicated review window.
+fn ensure_browser_running(browser_app: &str) {
+    let script = format!("application \"{}\" is running", applescript_escape(browser_app));
+    let already_running = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+        .unwrap_or(false);
+    if already_running {
+        return;
+    }
+    let launch = format!(
+        "tell application \"{}\" to launch",
+        applescript_escape(browser_app)
+    );
+    let _ = Command::new("osascript").arg("-e").arg(launch).output();
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+}
+
+/// Run an AppleScript, discarding its output. Returns whether it succeeded.
+fn run_applescript(script: &str) -> bool {
+    Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Create a brand-new window in `browser_app` showing `url` and return its
+/// AppleScript window id. Safari's `make new document` always creates a new
+/// window; other browsers use the window/tab AppleScript dictionary
+/// Chromium itself provides (Chrome, Brave, Edge, Vivaldi, Opera, … — any
+/// fork that hasn't removed it). Browsers without that dictionary (e.g. Arc)
+/// fail here, which the caller treats as "can't be driven this way".
+fn create_window_and_get_id(browser_app: &str, url: &str) -> Option<i64> {
     let app = applescript_escape(browser_app);
     let url = applescript_escape(url);
-    if browser_app.ends_with("/Safari.app") {
+    let script = if browser_app.ends_with("/Safari.app") {
         format!(
-            "tell application \"{app}\"\nmake new document with properties {{URL:\"{url}\"}}\nend tell"
+            "tell application \"{app}\"\n\
+             set newDoc to make new document with properties {{URL:\"{url}\"}}\n\
+             return id of window 1\n\
+             end tell"
         )
     } else {
         format!(
-            "tell application \"{app}\"\nset newWin to make new window\nset URL of active tab of newWin to \"{url}\"\nend tell"
+            "tell application \"{app}\"\n\
+             set newWin to make new window\n\
+             set URL of active tab of newWin to \"{url}\"\n\
+             return id of newWin\n\
+             end tell"
         )
+    };
+    let output = Command::new("osascript").arg("-e").arg(script).output().ok()?;
+    if !output.status.success() {
+        return None;
     }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// AppleScript that opens `url` as a new tab in the given window id, makes
+/// it the active tab, and raises that window and the browser to the front.
+fn add_tab_script(browser_app: &str, window_id: i64, url: &str) -> String {
+    let app = applescript_escape(browser_app);
+    let url = applescript_escape(url);
+    let activate_tab = if browser_app.ends_with("/Safari.app") {
+        "set current tab to newTab"
+    } else {
+        "set active tab index to (count of tabs)"
+    };
+    format!(
+        "tell application \"{app}\"\n\
+         if not (exists window id {window_id}) then error \"gh-review-insight: window gone\"\n\
+         tell window id {window_id}\n\
+         set newTab to make new tab with properties {{URL:\"{url}\"}}\n\
+         {activate_tab}\n\
+         end tell\n\
+         set index of window id {window_id} to 1\n\
+         end tell\n\
+         activate application \"{app}\""
+    )
 }
 
 /// Percent-encode a filesystem path into a `file://` URL. Spaces and other
@@ -1082,13 +1216,20 @@ mod tests {
     }
 
     #[test]
-    fn open_new_window_script_special_cases_safari() {
-        let safari = open_new_window_script("/Applications/Safari.app", "file:///a.html");
-        assert!(safari.contains("make new document with properties"));
+    fn add_tab_script_uses_the_right_activation_idiom_per_browser() {
+        let safari = add_tab_script("/Applications/Safari.app", 42, "file:///a.html");
+        assert!(safari.contains("set current tab to newTab"));
 
-        let chrome = open_new_window_script("/Applications/Google Chrome.app", "file:///a.html");
-        assert!(chrome.contains("make new window"));
-        assert!(chrome.contains("active tab"));
+        let chrome = add_tab_script("/Applications/Google Chrome.app", 42, "file:///a.html");
+        assert!(chrome.contains("set active tab index to (count of tabs)"));
+
+        // Both check the window still exists before touching it, and raise
+        // the window + app afterwards.
+        for script in [safari, chrome] {
+            assert!(script.contains("exists window id 42"));
+            assert!(script.contains("set index of window id 42 to 1"));
+            assert!(script.contains("activate application"));
+        }
     }
 
     #[test]
