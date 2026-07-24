@@ -523,12 +523,12 @@ pub fn save_sessions(sessions: &HashMap<String, AiSessionRecord>) {
     }
 }
 
-/// Open the saved review report as a tab in a dedicated "review window" in
-/// the default browser, reusing the same window across calls (mirrors the
-/// herdr tab consolidation used for reviews themselves) so reports pile up
-/// as tabs instead of scattering across new windows.
+/// Open the saved review report as a tab in a dedicated "review window",
+/// reusing the same window across calls (mirrors the herdr tab
+/// consolidation used for reviews themselves) so reports pile up as tabs
+/// instead of scattering across new windows.
 pub fn open_report(path: &str) -> Result<()> {
-    if let Some(browser_app) = default_browser_app() {
+    if let Some(browser_app) = report_browser_app() {
         if open_in_review_window(&browser_app, &file_url(path)) {
             return Ok(());
         }
@@ -542,9 +542,32 @@ pub fn open_report(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// The browser reports open in: Chrome specifically, regardless of the OS
+/// default browser (the user runs Arc system-wide but wants reports kept
+/// separate in Chrome). Falls back to the OS default when Chrome isn't
+/// installed, since some AppleScript-drivable browser is still worth trying
+/// before giving up to the plain `open` fallback.
+fn report_browser_app() -> Option<String> {
+    find_chrome().or_else(default_browser_app)
+}
+
+/// Locations commonly holding a Google Chrome install.
+fn find_chrome() -> Option<String> {
+    let mut candidates = vec![PathBuf::from("/Applications/Google Chrome.app")];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join("Applications/Google Chrome.app"));
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 /// The user's default web browser's `.app` bundle path — whatever `open
 /// https://…` would launch — found via `NSWorkspace` since browsers vary
 /// widely in what CLI flags or AppleScript they support for opening a URL.
+/// Used only as a fallback when Chrome isn't installed (see
+/// `report_browser_app`).
 fn default_browser_app() -> Option<String> {
     let script = r#"use framework "AppKit"
 use scripting additions
