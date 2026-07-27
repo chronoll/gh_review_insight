@@ -75,6 +75,7 @@ status ビューで PR を選択し、まとめて Claude Code にレビュー�
 仕組みと注意:
 
 - herdr が必要です（`brew install herdr`）。
+- モデルは `Sonnet 5`、reasoning effort は `xhigh` に固定して起動します（`--model sonnet --effort xhigh`）。ユーザー個人のデフォルト設定に関わらず、レビューの質が一定になるようにするためです。変更する場合は `src/claude.rs` の `REVIEW_MODEL` / `REVIEW_EFFORT`。
 - 実行ディレクトリは `$HOME/.config/gh-review-insight/workspace/` 固定です。初回はこのフォルダの信頼確認が claude 側で表示されるので承認してください（一度だけ）。
 - プロンプトとして PR の URL のみを送ります（初回のみ。再リクエスト時は上記の差分レビュー用プロンプト）。レビューは claude 側の pr-review スキルが URL を受けて発火します（プロンプトを変えたい場合は `src/claude.rs` の `review_prompt` / `re_review_prompt`）。
 - レビュータブはアプリを終了しても残ります（herdr サーバーが保持）。claude を exit すればタブは閉じます。herdr サーバー自体が終了・再起動した場合（PC 再起動など）はタブがすべて失われますが、上記の「続き」で再開できます。

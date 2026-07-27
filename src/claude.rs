@@ -70,6 +70,12 @@ fn augmented_path() -> String {
 /// gh-review skill's `allowed-tools` plus the orchestration tools.
 const REVIEW_ALLOWED_TOOLS: &str = "Bash,Glob,Grep,Read,Agent,Task,TodoWrite,Skill";
 
+/// Model and reasoning effort every `claude` invocation this app makes is
+/// pinned to, so review quality doesn't drift with whatever the user's own
+/// global default happens to be at the time.
+const REVIEW_MODEL: &str = "sonnet";
+const REVIEW_EFFORT: &str = "xhigh";
+
 /// The prompt sent to `claude` for one PR: the PR URL そのもの。レビューは
 /// pr-review スキルが URL を受けて発火する。
 fn review_prompt(pr_url: &str) -> String {
@@ -781,7 +787,19 @@ impl ClaudeClient {
         let prompt = review_prompt(pr_url);
         let session_id = generate_session_id()?;
 
-        let pane_id = spawn_herdr_tab(&window_name, &[&claude, "--session-id", &session_id, &prompt])?;
+        let pane_id = spawn_herdr_tab(
+            &window_name,
+            &[
+                &claude,
+                "--model",
+                REVIEW_MODEL,
+                "--effort",
+                REVIEW_EFFORT,
+                "--session-id",
+                &session_id,
+                &prompt,
+            ],
+        )?;
         Ok(LaunchedRecord {
             pane_id,
             window_name,
@@ -811,7 +829,15 @@ impl ClaudeClient {
     /// extra argument that claude processes as the next turn.
     fn continue_review(&self, record: &LaunchedRecord, prompt: Option<&str>) -> Result<LaunchedRecord> {
         let claude = resolve_claude(&self.claude_path);
-        let mut argv = vec![claude.as_str(), "--resume", record.session_id.as_str()];
+        let mut argv = vec![
+            claude.as_str(),
+            "--model",
+            REVIEW_MODEL,
+            "--effort",
+            REVIEW_EFFORT,
+            "--resume",
+            record.session_id.as_str(),
+        ];
         if let Some(prompt) = prompt {
             argv.push(prompt);
         }
@@ -866,6 +892,10 @@ impl ClaudeClient {
         cmd.current_dir(&workspace);
         cmd.arg("-p")
             .arg(review_prompt(pr_url))
+            .arg("--model")
+            .arg(REVIEW_MODEL)
+            .arg("--effort")
+            .arg(REVIEW_EFFORT)
             .arg("--output-format")
             .arg("json")
             .arg("--allowedTools")
