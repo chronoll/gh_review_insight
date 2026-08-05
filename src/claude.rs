@@ -112,24 +112,54 @@ fn find_herdr() -> Option<String> {
 /// Run a herdr CLI command and return the JSON `result` payload. herdr
 /// reports failures as an `error` object, which is surfaced as the error.
 fn herdr_run(args: &[&str]) -> Result<Value> {
-    let herdr = find_herdr().ok_or_else(|| anyhow!("herdr が見つかりませんでした。"))?;
+    const ATTEMPTS: u32 = 3;
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            // A transient hiccup (seen with dozens of concurrent review
+            // panes open) — give herdr a moment before retrying.
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+        match herdr_run_once(args) {
+            Ok(value) => return Ok(value),
+            Err((transient, err)) => {
+                if !transient {
+                    return Err(err);
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+/// Run a herdr CLI command once. The bool distinguishes a transient failure
+/// (process spawn hiccup, or truncated/non-JSON output — worth retrying,
+/// this has been observed under heavy load even though the command actually
+/// went through server-side) from a genuine `{"error": ...}` response from
+/// herdr itself (a real failure; retrying it wouldn't help).
+fn herdr_run_once(args: &[&str]) -> std::result::Result<Value, (bool, anyhow::Error)> {
+    let herdr = find_herdr().ok_or_else(|| (false, anyhow!("herdr が見つかりませんでした。")))?;
     let output = Command::new(herdr)
         .env("PATH", augmented_path())
         .args(args)
         .output()
-        .map_err(|err| anyhow!("herdr を実行できませんでした: {err}"))?;
+        .map_err(|err| (true, anyhow!("herdr を実行できませんでした: {err}")))?;
     let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let trimmed = stderr.trim();
-        anyhow!(if trimmed.is_empty() {
-            format!("herdr {} がJSON応答を返しませんでした。", args.first().unwrap_or(&""))
-        } else {
-            trimmed.to_string()
-        })
+        (
+            true,
+            anyhow!(if trimmed.is_empty() {
+                format!("herdr {} がJSON応答を返しませんでした。", args.first().unwrap_or(&""))
+            } else {
+                trimmed.to_string()
+            }),
+        )
     })?;
     if let Some(error) = value.get("error") {
         let message = error["message"].as_str().unwrap_or("不明なエラー");
-        return Err(anyhow!("herdr {}: {message}", args.first().unwrap_or(&"")));
+        return Err((false, anyhow!("herdr {}: {message}", args.first().unwrap_or(&""))));
     }
     Ok(value["result"].clone())
 }
