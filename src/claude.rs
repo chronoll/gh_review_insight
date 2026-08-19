@@ -112,32 +112,48 @@ fn find_herdr() -> Option<String> {
 /// Run a herdr CLI command and return the JSON `result` payload. herdr
 /// reports failures as an `error` object, which is surfaced as the error.
 fn herdr_run(args: &[&str]) -> Result<Value> {
-    const ATTEMPTS: u32 = 3;
-    let mut last_err = None;
-    for attempt in 0..ATTEMPTS {
+    // `agent_pane_busy` (a pane fresh out of `pane split` whose shell hasn't
+    // finished starting up) has been measured clearing anywhere from well
+    // under a second to over 20s depending on system load (a heavy `zsh`
+    // startup — pyenv's `rehash` in particular — is the prime suspect), with
+    // no reliable upper bound from a small fixed attempt count — so this
+    // retries on elapsed wall-clock time instead of a fixed count.
+    // `ensure_herdr_workspace` reuses an idle pane instead of splitting a
+    // fresh one whenever possible, which avoids paying this cost at all in
+    // the common case; this generous ceiling is the fallback for when a
+    // fresh pane genuinely is required.
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+    const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+    let start = std::time::Instant::now();
+    let mut attempt = 0u32;
+    loop {
         if attempt > 0 {
-            // A transient hiccup (seen with dozens of concurrent review
-            // panes open) — give herdr a moment before retrying.
-            std::thread::sleep(std::time::Duration::from_millis(400));
+            std::thread::sleep(RETRY_INTERVAL);
         }
         match herdr_run_once(args) {
             Ok(value) => return Ok(value),
             Err((transient, err)) => {
-                if !transient {
+                if !transient || start.elapsed() >= MAX_WAIT {
                     return Err(err);
                 }
-                last_err = Some(err);
             }
         }
+        attempt += 1;
     }
-    Err(last_err.unwrap())
 }
 
+/// herdr error codes that are worth retrying: the underlying condition
+/// clears on its own shortly after. `agent_pane_busy` shows up when `agent
+/// start` targets a pane that `pane split` only just created — its shell
+/// hasn't finished starting up yet, not a real failure.
+const TRANSIENT_HERDR_ERROR_CODES: &[&str] = &["agent_pane_busy"];
+
 /// Run a herdr CLI command once. The bool distinguishes a transient failure
-/// (process spawn hiccup, or truncated/non-JSON output — worth retrying,
-/// this has been observed under heavy load even though the command actually
-/// went through server-side) from a genuine `{"error": ...}` response from
-/// herdr itself (a real failure; retrying it wouldn't help).
+/// (process spawn hiccup, truncated/non-JSON output, or a known-transient
+/// error code — worth retrying, this has been observed under heavy load even
+/// though the command actually went through server-side) from a genuine
+/// `{"error": ...}` response from herdr itself (a real failure; retrying it
+/// wouldn't help).
 fn herdr_run_once(args: &[&str]) -> std::result::Result<Value, (bool, anyhow::Error)> {
     let herdr = find_herdr().ok_or_else(|| (false, anyhow!("herdr が見つかりませんでした。")))?;
     let output = Command::new(herdr)
@@ -159,13 +175,22 @@ fn herdr_run_once(args: &[&str]) -> std::result::Result<Value, (bool, anyhow::Er
     })?;
     if let Some(error) = value.get("error") {
         let message = error["message"].as_str().unwrap_or("不明なエラー");
-        return Err((false, anyhow!("herdr {}: {message}", args.first().unwrap_or(&""))));
+        let transient = error["code"]
+            .as_str()
+            .is_some_and(|code| TRANSIENT_HERDR_ERROR_CODES.contains(&code));
+        return Err((transient, anyhow!("herdr {}: {message}", args.first().unwrap_or(&""))));
     }
     Ok(value["result"].clone())
 }
 
-/// Find or create the dedicated review workspace, returning its id.
-fn ensure_herdr_workspace(cwd: &str) -> Result<String> {
+/// Find or create the dedicated review workspace. Returns `(workspace_id,
+/// pane_id)` where `pane_id` is a pane ready to host a new agent — the
+/// just-created workspace's root pane (nothing has run in it yet), an idle
+/// pane already sitting in an existing workspace (reused as-is — its shell
+/// finished starting long ago, avoiding a fresh shell's startup cost, which
+/// has been observed taking anywhere from under a second to tens of seconds
+/// under load), or as a last resort a fresh pane split off an existing one.
+fn ensure_herdr_workspace(cwd: &str) -> Result<(String, String)> {
     let list = herdr_run(&["workspace", "list"])?;
     let existing = list["workspaces"].as_array().and_then(|workspaces| {
         workspaces
@@ -174,16 +199,47 @@ fn ensure_herdr_workspace(cwd: &str) -> Result<String> {
             .and_then(|ws| ws["workspace_id"].as_str())
             .map(str::to_string)
     });
-    if let Some(id) = existing {
-        return Ok(id);
+    if let Some(ws_id) = existing {
+        let panes = herdr_run(&["pane", "list", "--workspace", &ws_id])?;
+        let panes = panes["panes"]
+            .as_array()
+            .filter(|panes| !panes.is_empty())
+            .ok_or_else(|| anyhow!("herdr pane list の応答から pane 一覧を取得できませんでした。"))?;
+        // An idle pane (no `agent` occupying it) has already finished its
+        // shell startup — reuse it directly instead of paying that cost
+        // again via `pane split`.
+        if let Some(idle) = panes.iter().find(|pane| pane["agent"].is_null()) {
+            let pane_id = idle["pane_id"]
+                .as_str()
+                .ok_or_else(|| anyhow!("herdr pane list の応答から pane id を取得できませんでした。"))?
+                .to_string();
+            return Ok((ws_id, pane_id));
+        }
+        let base_pane = panes
+            .first()
+            .and_then(|pane| pane["pane_id"].as_str())
+            .ok_or_else(|| anyhow!("herdr pane list の応答から pane id を取得できませんでした。"))?;
+        let split = herdr_run(&[
+            "pane", "split", base_pane, "--direction", "right", "--cwd", cwd, "--no-focus",
+        ])?;
+        let pane_id = split["pane"]["pane_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("herdr pane split の応答から pane id を取得できませんでした。"))?
+            .to_string();
+        return Ok((ws_id, pane_id));
     }
     let created = herdr_run(&[
         "workspace", "create", "--label", HERDR_WORKSPACE_LABEL, "--no-focus", "--cwd", cwd,
     ])?;
-    created["workspace"]["workspace_id"]
+    let workspace_id = created["workspace"]["workspace_id"]
         .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("herdr workspace create の応答から id を取得できませんでした。"))
+        .ok_or_else(|| anyhow!("herdr workspace create の応答から id を取得できませんでした。"))?
+        .to_string();
+    let pane_id = created["root_pane"]["pane_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("herdr workspace create の応答から pane id を取得できませんでした。"))?
+        .to_string();
+    Ok((workspace_id, pane_id))
 }
 
 /// Start `argv` as a herdr agent in the dedicated review workspace, moved
@@ -194,10 +250,21 @@ fn spawn_herdr_tab(window_name: &str, argv: &[&str]) -> Result<String> {
     std::fs::create_dir_all(&workspace)
         .context("workspace ディレクトリを作成できませんでした")?;
     let cwd = workspace.to_string_lossy().into_owned();
-    let ws_id = ensure_herdr_workspace(&cwd)?;
+    let (ws_id, base_pane) = ensure_herdr_workspace(&cwd)?;
 
+    // herdr agent names must match `[a-z][a-z0-9_-]{0,31}` — `window_name`
+    // (e.g. `delish-web2#4402`) contains `#`, which herdr rejects outright
+    // with a permanent `invalid_agent_name` error (every subsequent retry
+    // fails identically, so this alone can burn through the whole retry
+    // budget). The tab label below keeps the human-readable form; only the
+    // agent name needs sanitizing.
+    let agent_name = sanitize_agent_name(window_name);
+
+    // `agent start` runs a command inside an existing pane rather than
+    // creating one, so it needs a pane of its own (`base_pane`, prepared by
+    // `ensure_herdr_workspace`) up front.
     let mut args = vec![
-        "agent", "start", window_name, "--workspace", &ws_id, "--cwd", &cwd, "--no-focus", "--",
+        "agent", "start", &agent_name, "--kind", "claude", "--pane", &base_pane, "--",
     ];
     args.extend_from_slice(argv);
     let started = herdr_run(&args)?;
@@ -207,8 +274,8 @@ fn spawn_herdr_tab(window_name: &str, argv: &[&str]) -> Result<String> {
     if terminal_id.is_empty() || pane_id.is_empty() {
         return Err(anyhow!("herdr agent start の応答から id を取得できませんでした。"));
     }
-    // `agent start` splits into the workspace's active tab; give the run its
-    // own labeled tab. The label doubles as the identity check used by the
+    // Give the run its own labeled tab instead of sharing the workspace's
+    // active one. The label doubles as the identity check used by the
     // liveness filter, so a failure here is a real error.
     herdr_run(&[
         "pane", "move", &pane_id, "--new-tab", "--workspace", &ws_id, "--label", window_name,
@@ -813,14 +880,14 @@ impl ClaudeClient {
     /// later); the review itself keeps running in its tab.
     pub fn launch_review(&self, pr_url: &str, pr_key: &str) -> Result<LaunchedRecord> {
         let window_name = pr_key.rsplit('/').next().unwrap_or(pr_key).to_string();
-        let claude = resolve_claude(&self.claude_path);
         let prompt = review_prompt(pr_url);
         let session_id = generate_session_id()?;
 
+        // `--kind claude` makes herdr resolve and prepend the `claude`
+        // executable itself — only its native arguments go after `--`.
         let pane_id = spawn_herdr_tab(
             &window_name,
             &[
-                &claude,
                 "--model",
                 REVIEW_MODEL,
                 "--effort",
@@ -858,9 +925,8 @@ impl ClaudeClient {
     /// a new tab running `claude --resume <session_id>`, optionally with an
     /// extra argument that claude processes as the next turn.
     fn continue_review(&self, record: &LaunchedRecord, prompt: Option<&str>) -> Result<LaunchedRecord> {
-        let claude = resolve_claude(&self.claude_path);
+        // See `launch_review`: `--kind claude` supplies the executable itself.
         let mut argv = vec![
-            claude.as_str(),
             "--model",
             REVIEW_MODEL,
             "--effort",
@@ -1188,6 +1254,34 @@ fn parse_run_output(value: &Value) -> Result<(String, String)> {
     Ok((session_id, value["result"].as_str().unwrap_or("").to_string()))
 }
 
+/// Sanitize a display key (e.g. `repo#42`) into a valid herdr agent name:
+/// must start with a lowercase letter and contain only lowercase letters,
+/// digits, `-`, or `_` (1-32 chars) — herdr rejects anything else outright
+/// with a permanent `invalid_agent_name` error.
+fn sanitize_agent_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        return "review".to_string();
+    }
+    let mut out = if cleaned.starts_with(|c: char| c.is_ascii_lowercase()) {
+        cleaned
+    } else {
+        format!("r-{cleaned}")
+    };
+    out.truncate(32);
+    out
+}
+
 /// `owner/repo#42` -> `owner-repo-42` (filesystem-safe stem).
 fn sanitize_file_stem(key: &str) -> String {
     key.chars()
@@ -1367,6 +1461,25 @@ mod tests {
             sanitize_file_stem("everytv/delish-web2#4501"),
             "everytv-delish-web2-4501"
         );
+    }
+
+    #[test]
+    fn window_name_becomes_a_valid_herdr_agent_name() {
+        // The real-world shape (`repo#42`) — `#` is invalid and must not
+        // survive, or herdr rejects it outright with `invalid_agent_name`.
+        assert_eq!(sanitize_agent_name("delish-web2#4402"), "delish-web2-4402");
+        // Uppercase must be lowered.
+        assert_eq!(sanitize_agent_name("Delish-Web2#42"), "delish-web2-42");
+        // A name that would start with a digit or symbol gets a lowercase
+        // prefix instead (herdr requires the first char to be a-z).
+        assert_eq!(sanitize_agent_name("42"), "r-42");
+        assert_eq!(sanitize_agent_name("#42"), "r--42");
+        // Over-long names are truncated to herdr's 32-char limit.
+        let long = "a".repeat(50);
+        assert_eq!(sanitize_agent_name(&long).len(), 32);
+        // Empty input has nothing to keep — fall back to a fixed valid name
+        // rather than producing an empty (also invalid) string.
+        assert_eq!(sanitize_agent_name(""), "review");
     }
 
     #[test]
