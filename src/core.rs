@@ -229,7 +229,10 @@ fn status_priority(summary: &PullRequestSummary) -> i32 {
 ///
 /// Reviews authored by anyone in `ignored` (e.g. bots like coderabbit) are
 /// dropped entirely, so they affect neither the status classification, the
-/// "others" column, nor the stats aggregation.
+/// "others" column, nor the stats aggregation. The PR author's own reviews
+/// (GitHub records self-comments/replies as COMMENTED reviews) are dropped
+/// the same way: they must not flip a requested reviewer's PR to "should"
+/// nor mark the author's own PR as reviewed.
 pub fn summarize_pull_request(
     node: &Value,
     login: &str,
@@ -245,8 +248,12 @@ pub fn summarize_pull_request(
         .filter_map(format_requested_reviewer)
         .collect();
 
+    let pr_author = node["author"]["login"].as_str().unwrap_or("");
     let mut reviews = parse_reviews(node);
-    reviews.retain(|review| !ignored.iter().any(|name| name == &review.author));
+    reviews.retain(|review| {
+        (pr_author.is_empty() || review.author != pr_author)
+            && !ignored.iter().any(|name| name == &review.author)
+    });
     let latest_by_author = latest_reviews_by_author(&reviews);
     let my_latest_review = latest_by_author.get(login).cloned();
     // BTreeMap iterates in author order, matching the Python `sorted(...)`.
@@ -267,7 +274,7 @@ pub fn summarize_pull_request(
         number: node["number"].as_i64().unwrap_or(0),
         title: node["title"].as_str().unwrap_or("").to_string(),
         url: node["url"].as_str().unwrap_or("").to_string(),
-        author: node["author"]["login"].as_str().unwrap_or("").to_string(),
+        author: pr_author.to_string(),
         state: node["state"].as_str().unwrap_or("").to_string(),
         is_draft: node["isDraft"].as_bool().unwrap_or(false),
         review_decision: node["reviewDecision"].as_str().map(str::to_string),
@@ -595,6 +602,27 @@ mod tests {
         // With someone else's review present, it becomes "others reviewed".
         let summary2 = summarize_pull_request(&fixture_pr(), "erin", &["requested".to_string()], &[]);
         assert_eq!(summary2.review_status(), ReviewStatus::RequestedOthersReviewed);
+    }
+
+    #[test]
+    fn author_self_comment_does_not_count_as_review() {
+        // alice (the PR author) commented on her own PR; erin is requested.
+        // The self-comment must not flip erin's status to "should".
+        let mut node = fixture_pr();
+        node["reviews"]["nodes"] = json!([
+            {"author": {"login": "alice"}, "state": "COMMENTED",
+             "submittedAt": "2026-06-02T00:00:00Z",
+             "url": "https://github.com/acme/widgets/pull/42#review-9"}
+        ]);
+        let summary = summarize_pull_request(&node, "erin", &["requested".to_string()], &[]);
+        assert!(summary.other_latest_reviews.is_empty());
+        assert_eq!(summary.review_status(), ReviewStatus::RequestedUntouched);
+
+        // Nor does it mark the PR as reviewed for alice herself, even though
+        // the self-comment makes the PR match the `reviewed-by:` search.
+        let summary2 = summarize_pull_request(&node, "alice", &["reviewed".to_string()], &[]);
+        assert!(summary2.my_latest_review.is_none());
+        assert_eq!(summary2.review_status(), ReviewStatus::Other);
     }
 
     #[test]

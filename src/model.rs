@@ -58,10 +58,10 @@ impl ReviewStatus {
     pub fn description(self) -> &'static str {
         match self {
             ReviewStatus::RequestedUntouched => {
-                "リクエストがあり自分の対応が必要（誰も未レビュー、または一度レビュー後に再リクエストされた）"
+                "リクエストがあり自分の対応が必要（誰も未レビュー、または一度レビュー後に再リクエストされた。PR作者本人のコメントはレビューとして数えない）"
             }
             ReviewStatus::RequestedOthersReviewed => {
-                "リクエストがあり自分はレビューしていないが、誰かがレビューした"
+                "リクエストがあり自分はレビューしていないが、PR作者以外の誰かがレビューした"
             }
             ReviewStatus::Reviewed => "リクエストがあり自分がレビューした（またはレビュー済み）",
             ReviewStatus::Other => "その他",
