@@ -82,6 +82,11 @@ enum ViewState {
 
 /// Lifecycle of the Claude review for one PR (absent = not started).
 enum AiReview {
+    /// A launch/resume request is running on a background thread. herdr's
+    /// CLI round-trip can legitimately take up to its retry ceiling (tens of
+    /// seconds, e.g. while `agent_pane_busy` clears under load), so this
+    /// state exists purely so the UI thread is never the one waiting on it.
+    Pending,
     /// An interactive run as a herdr tab; holds the identity used to focus
     /// this PR's tab. Persisted and restored across app restarts while the
     /// pane is alive.
@@ -92,6 +97,14 @@ enum AiReview {
     Resumable(LaunchedRecord),
     /// A finished headless run (loaded from ai_sessions.json).
     Done(AiSessionRecord),
+    Failed(String),
+}
+
+/// Outcome of a background launch/resume, delivered back to the UI thread
+/// over a channel (see `App::ai_rx`) so herdr's occasionally-slow CLI calls
+/// never run on the UI thread.
+enum AiActionOutcome {
+    Launched(LaunchedRecord),
     Failed(String),
 }
 
@@ -143,6 +156,13 @@ pub struct App {
     /// Review reports on disk, keyed by `repo#番号`, newest first. Rescanned
     /// on every status reload.
     reports: HashMap<String, Vec<ReviewReport>>,
+    /// In-flight launch/resume background threads. Each yields `(pr_url,
+    /// outcome)` pairs — one thread can drive several PRs in sequence (a
+    /// batch launch), so results arrive one at a time rather than as a
+    /// single value. herdr's CLI round-trip can legitimately take tens of
+    /// seconds (e.g. `agent_pane_busy` retries under load), so these run off
+    /// the UI thread; `poll` drains whichever have finished.
+    ai_rx: Vec<Receiver<(String, AiActionOutcome)>>,
 }
 
 impl App {
@@ -184,6 +204,7 @@ impl App {
             selected: HashSet::new(),
             ai,
             reports: claude::load_review_reports(),
+            ai_rx: Vec::new(),
         }
     }
 
@@ -255,6 +276,49 @@ impl App {
                 self.rx = None;
             }
         }
+
+        // Drain every finished (or partially finished, for a batch launch)
+        // background thread. A thread is done with a given receiver once its
+        // sender drops, reported as `Disconnected` — keep the receiver
+        // around otherwise so later results from the same batch still land.
+        //
+        // Only a successful `Launched` outcome should trigger a save:
+        // `save_launched` rewrites the whole file from `self.ai`, and a
+        // `Failed` resume/launch has nothing worth persisting — but if it
+        // did trigger a save, the PR's *prior* on-disk record (e.g. a
+        // `Resumable` entry with the session id to retry from) would be
+        // wiped out along with it, since `self.ai` now holds `Failed` for
+        // that url instead. A failure here must leave the file untouched.
+        let mut any_launched = false;
+        let mut still_running = Vec::new();
+        for rx in std::mem::take(&mut self.ai_rx) {
+            let mut disconnected = false;
+            loop {
+                match rx.try_recv() {
+                    Ok((url, outcome)) => match outcome {
+                        AiActionOutcome::Launched(record) => {
+                            self.ai.insert(url, AiReview::Launched(record));
+                            any_launched = true;
+                        }
+                        AiActionOutcome::Failed(message) => {
+                            self.ai.insert(url, AiReview::Failed(message));
+                        }
+                    },
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            if !disconnected {
+                still_running.push(rx);
+            }
+        }
+        self.ai_rx = still_running;
+        if any_launched {
+            self.save_launched();
+        }
     }
 
     /// Check every actionable (waiting / should) visible PR.
@@ -305,6 +369,11 @@ impl App {
     /// a tab is already running AND it isn't a fresh re-request (re-requests
     /// always get to re-review, even while the old tab is still open).
     fn blocks_selection(&self, pr: &PullRequestSummary) -> bool {
+        // A launch/resume already in flight for this PR — never start a
+        // second one on top of it.
+        if matches!(self.ai.get(&pr.url), Some(AiReview::Pending)) {
+            return true;
+        }
         self.is_launched(&pr.url) && self.re_review_target(pr).is_none()
     }
 
@@ -312,8 +381,13 @@ impl App {
     /// show the herdr client (unless one is already visible). PRs that were
     /// re-requested after a prior AI review resume that review's session
     /// with a re-request prompt instead of starting a brand-new one.
-    /// Launching is just a few herdr API calls, so it runs on the UI thread.
-    fn start_ai_reviews(&mut self) {
+    ///
+    /// herdr's CLI round-trip can legitimately take tens of seconds (e.g.
+    /// `agent_pane_busy` retries while a freshly split pane's shell is still
+    /// starting up under load), so this runs on a background thread rather
+    /// than the UI thread — otherwise the whole app would appear to hang for
+    /// however long that retry takes.
+    fn start_ai_reviews(&mut self, ctx: &egui::Context) {
         let ViewState::Ready(Loaded::Status(prs)) = &self.state else {
             return;
         };
@@ -327,30 +401,43 @@ impl App {
             return;
         }
 
-        let client = ClaudeClient::new(self.claude_path.clone());
-        let mut launched_any = false;
-        for (url, pr_key, prior) in targets {
-            self.selected.remove(&url);
-            let result = match &prior {
-                Some(record) => client.launch_re_review(&url, record),
-                None => client.launch_review(&url, &pr_key),
-            };
-            match result {
-                Ok(record) => {
-                    self.ai.insert(url, AiReview::Launched(record));
-                    launched_any = true;
-                }
-                Err(err) => {
-                    self.ai.insert(url, AiReview::Failed(format!("{err:#}")));
+        for (url, ..) in &targets {
+            self.selected.remove(url);
+            self.ai.insert(url.clone(), AiReview::Pending);
+        }
+        // Without this, the `Pending` state just set above wouldn't paint
+        // until whatever next redraws the UI (e.g. a mouse move) — egui
+        // doesn't repaint on its own just because state changed mid-frame.
+        ctx.request_repaint();
+
+        let claude_path = self.claude_path.clone();
+        let (tx, rx) = channel();
+        self.ai_rx.push(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let client = ClaudeClient::new(claude_path);
+            let mut launched_any = false;
+            for (url, pr_key, prior) in targets {
+                let result = match &prior {
+                    Some(record) => client.launch_re_review(&url, record),
+                    None => client.launch_review(&url, &pr_key),
+                };
+                let outcome = match result {
+                    Ok(record) => {
+                        launched_any = true;
+                        AiActionOutcome::Launched(record)
+                    }
+                    Err(err) => AiActionOutcome::Failed(format!("{err:#}")),
+                };
+                let _ = tx.send((url, outcome));
+                ctx.request_repaint();
+            }
+            if launched_any {
+                if let Err(err) = client.show_review_terminal(true) {
+                    eprintln!("warning: {err:#}");
                 }
             }
-        }
-        if launched_any {
-            self.save_launched();
-            if let Err(err) = client.show_review_terminal(true) {
-                eprintln!("warning: {err:#}");
-            }
-        }
+        });
     }
 
     /// Persist the currently launched/resumable (herdr) reviews.
@@ -368,7 +455,7 @@ impl App {
         claude::save_launched_reviews(&launched);
     }
 
-    fn apply_table_actions(&mut self, actions: TableActions) {
+    fn apply_table_actions(&mut self, actions: TableActions, ctx: &egui::Context) {
         for url in actions.toggle {
             if !self.selected.remove(&url) {
                 self.selected.insert(url);
@@ -386,25 +473,52 @@ impl App {
             }
         }
         if let Some(record) = actions.focus {
-            let client = ClaudeClient::new(self.claude_path.clone());
-            if let Err(err) = client.focus_review_window(&record) {
-                eprintln!("warning: {err:#}");
-            }
+            // Off the UI thread: `agent focus` round-trips through the same
+            // herdr CLI as launch/resume, so it can be just as slow.
+            let claude_path = self.claude_path.clone();
+            std::thread::spawn(move || {
+                let client = ClaudeClient::new(claude_path);
+                if let Err(err) = client.focus_review_window(&record) {
+                    eprintln!("warning: {err:#}");
+                }
+            });
         }
         if let Some((url, record)) = actions.resume_herdr {
-            let client = ClaudeClient::new(self.claude_path.clone());
-            match client.resume_review(&record) {
-                Ok(new_record) => {
-                    self.ai.insert(url, AiReview::Launched(new_record));
-                    self.save_launched();
-                    if let Err(err) = client.show_review_terminal(false) {
-                        eprintln!("warning: {err:#}");
+            debug_log(&format!("resume_herdr: begin url={url}"));
+            self.ai.insert(url.clone(), AiReview::Pending);
+            ctx.request_repaint();
+            let claude_path = self.claude_path.clone();
+            let (tx, rx) = channel();
+            self.ai_rx.push(rx);
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let client = ClaudeClient::new(claude_path);
+                debug_log("resume_herdr: thread started, calling resume_review");
+                let resume_result = client.resume_review(&record);
+                debug_log(&format!(
+                    "resume_herdr: resume_review returned ok={}",
+                    resume_result.is_ok()
+                ));
+                let outcome = match resume_result {
+                    Ok(new_record) => {
+                        if let Err(err) = client.show_review_terminal(false) {
+                            eprintln!("warning: {err:#}");
+                        }
+                        AiActionOutcome::Launched(new_record)
                     }
-                }
-                Err(err) => {
-                    self.ai.insert(url, AiReview::Failed(format!("{err:#}")));
-                }
-            }
+                    Err(err) => {
+                        debug_log(&format!("resume_herdr: error = {err:#}"));
+                        AiActionOutcome::Failed(format!("{err:#}"))
+                    }
+                };
+                let send_result = tx.send((url, outcome));
+                debug_log(&format!(
+                    "resume_herdr: tx.send ok={}, calling request_repaint",
+                    send_result.is_ok()
+                ));
+                ctx.request_repaint();
+                debug_log("resume_herdr: thread ending");
+            });
         }
     }
 
@@ -451,7 +565,7 @@ impl App {
                         .on_hover_text("選択した PR ごとに herdr のタブとして claude を起動（実行の様子をターミナルで確認できます）")
                         .clicked()
                     {
-                        self.start_ai_reviews();
+                        self.start_ai_reviews(ctx);
                     }
                     if count > 0 && ui.button("解除").clicked() {
                         self.selected.clear();
@@ -652,6 +766,10 @@ impl App {
         match self.ai.get(&pr.url) {
             None => {
                 ui.label("-");
+            }
+            Some(AiReview::Pending) => {
+                ui.add_enabled(false, egui::Button::new("…"))
+                    .on_hover_text("herdr とやり取り中です（数秒〜数十秒かかることがあります）");
             }
             Some(AiReview::Launched(record)) => {
                 if ui
@@ -1039,6 +1157,26 @@ impl App {
     }
 }
 
+/// TEMPORARY debug instrumentation for the resume-herdr-stuck investigation.
+/// Appends to `~/.config/gh-review-insight/debug.log`; remove once resolved.
+fn debug_log(msg: &str) {
+    use std::io::Write;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(home).join(".config/gh-review-insight/debug.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{now}] {msg}");
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.started {
@@ -1063,7 +1201,7 @@ impl eframe::App for App {
             ViewState::Ready(Loaded::Status(prs)) => self.table(ui, prs, &mut actions),
             ViewState::Ready(Loaded::Stats(stats)) => self.stats_view(ui, stats),
         });
-        self.apply_table_actions(actions);
+        self.apply_table_actions(actions, ctx);
 
         self.settings_window(ctx);
     }

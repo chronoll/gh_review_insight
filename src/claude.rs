@@ -244,7 +244,9 @@ fn ensure_herdr_workspace(cwd: &str) -> Result<(String, String)> {
 
 /// Start `argv` as a herdr agent in the dedicated review workspace, moved
 /// into its own tab labeled `window_name` (one tab per PR). Returns the new
-/// tab's terminal id, used to focus it later.
+/// tab's pane id, used to focus it later via `agent focus` (which — unlike
+/// `agent get`/`agent read` — only accepts an agent name or a pane id, never
+/// a terminal id).
 fn spawn_herdr_tab(window_name: &str, argv: &[&str]) -> Result<String> {
     let workspace = workspace_dir()?;
     std::fs::create_dir_all(&workspace)
@@ -268,20 +270,23 @@ fn spawn_herdr_tab(window_name: &str, argv: &[&str]) -> Result<String> {
     ];
     args.extend_from_slice(argv);
     let started = herdr_run(&args)?;
-    let agent = &started["agent"];
-    let terminal_id = agent["terminal_id"].as_str().unwrap_or("").to_string();
-    let pane_id = agent["pane_id"].as_str().unwrap_or("").to_string();
-    if terminal_id.is_empty() || pane_id.is_empty() {
-        return Err(anyhow!("herdr agent start の応答から id を取得できませんでした。"));
+    let pane_id = started["agent"]["pane_id"].as_str().unwrap_or("").to_string();
+    if pane_id.is_empty() {
+        return Err(anyhow!("herdr agent start の応答から pane id を取得できませんでした。"));
     }
     // Give the run its own labeled tab instead of sharing the workspace's
     // active one. The label doubles as the identity check used by the
-    // liveness filter, so a failure here is a real error.
-    herdr_run(&[
+    // liveness filter, so a failure here is a real error. `pane move` can
+    // hand back a different (workspace-qualified) pane id than the one
+    // passed in, so the id used afterwards must come from its response.
+    let moved = herdr_run(&[
         "pane", "move", &pane_id, "--new-tab", "--workspace", &ws_id, "--label", window_name,
         "--no-focus",
     ])?;
-    Ok(terminal_id)
+    Ok(moved["move_result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap_or(&pane_id)
+        .to_string())
 }
 
 /// Generate a UUID for a new claude session via macOS's `uuidgen`. Passed to
@@ -303,7 +308,24 @@ fn generate_session_id() -> Result<String> {
     Ok(id)
 }
 
-/// The live review panes in the herdr workspace: terminal id -> label.
+/// The pane id of a live herdr agent with the given name, if one exists.
+/// Checked before resuming/re-reviewing: a herdr agent name must be unique
+/// among live agents, so if the review's own earlier session is still
+/// running under this name, `agent start` for a second one would fail
+/// outright with a permanent `agent_name_taken` error (this is exactly what
+/// happens the first time a review is resumed while its own tab is still
+/// alive and idle — the name never frees up).
+fn find_live_agent_by_name(name: &str) -> Option<String> {
+    let list = herdr_run(&["agent", "list"]).ok()?;
+    list["agents"].as_array()?.iter().find_map(|agent| {
+        (agent["name"].as_str() == Some(name))
+            .then(|| agent["pane_id"].as_str().map(str::to_string))
+            .flatten()
+    })
+}
+
+/// The live review panes in the herdr workspace: pane id -> label. Keyed by
+/// pane id (not terminal id) to match what `LaunchedRecord.pane_id` stores.
 /// Empty when herdr (or its server) is not running — panes are dead then.
 fn live_herdr_reviews() -> HashMap<String, String> {
     let Ok(list) = herdr_run(&["workspace", "list"]) else {
@@ -327,9 +349,9 @@ fn live_herdr_reviews() -> HashMap<String, String> {
             panes
                 .iter()
                 .filter_map(|pane| {
-                    let terminal_id = pane["terminal_id"].as_str()?;
+                    let pane_id = pane["pane_id"].as_str()?;
                     let label = pane["label"].as_str()?;
-                    Some((terminal_id.to_string(), label.to_string()))
+                    Some((pane_id.to_string(), label.to_string()))
                 })
                 .collect()
         })
@@ -394,7 +416,11 @@ impl AiSessionRecord {
 /// A review launched interactively as a herdr tab.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchedRecord {
-    /// herdr terminal id (`term_…`), used to focus this PR's tab.
+    /// herdr pane id (e.g. `w3:p7`), used to focus this PR's tab via
+    /// `agent focus`. Deliberately NOT a terminal id (`term_…`) — herdr's
+    /// agent commands only accept an agent name or a pane id, so a terminal
+    /// id here made every `agent focus` call fail outright with
+    /// `agent_not_found` (the "herdr" button never worked).
     pub pane_id: String,
     /// The tab name the run was created with (`repo#42`), double-checking
     /// identity in case ids are ever reused.
@@ -925,6 +951,24 @@ impl ClaudeClient {
     /// a new tab running `claude --resume <session_id>`, optionally with an
     /// extra argument that claude processes as the next turn.
     fn continue_review(&self, record: &LaunchedRecord, prompt: Option<&str>) -> Result<LaunchedRecord> {
+        // If the earlier session's own agent is still alive under this same
+        // name (e.g. it finished and has sat idle ever since — nothing ever
+        // frees the name), starting a second one under that name isn't
+        // possible at all: focus the existing tab instead, delivering a
+        // re-review prompt straight to that live agent rather than losing it.
+        let agent_name = sanitize_agent_name(&record.window_name);
+        if let Some(pane_id) = find_live_agent_by_name(&agent_name) {
+            let _ = herdr_run(&["agent", "focus", &pane_id]);
+            if let Some(prompt) = prompt {
+                herdr_run(&["agent", "prompt", &pane_id, prompt])?;
+            }
+            return Ok(LaunchedRecord {
+                pane_id,
+                window_name: record.window_name.clone(),
+                session_id: record.session_id.clone(),
+            });
+        }
+
         // See `launch_review`: `--kind claude` supplies the executable itself.
         let mut argv = vec![
             "--model",
@@ -1432,7 +1476,7 @@ mod tests {
     #[test]
     fn launched_record_roundtrips_through_json() {
         let record = LaunchedRecord {
-            pane_id: "term_abc123".to_string(),
+            pane_id: "w3:p7".to_string(),
             window_name: "widgets#42".to_string(),
             session_id: "8b654f7f-042e-413e-9232-b7e0c9eba66b".to_string(),
         };
@@ -1447,7 +1491,7 @@ mod tests {
         );
         // Records written before session-id tracking default to empty.
         let pre_feature = serde_json::json!({
-            "pane_id": "term_x", "window_name": "w", "backend": "herdr",
+            "pane_id": "w3:p9", "window_name": "w", "backend": "herdr",
         });
         assert_eq!(
             LaunchedRecord::from_value(&pre_feature).map(|r| r.session_id),
