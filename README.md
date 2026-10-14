@@ -56,7 +56,7 @@ cargo install --path .     # PATH に gh-review-insight を入れる
 - ツールバーの `status` / `stats` でビュー切替、`⟳ 更新` で再取得、`⚙ 設定` で色設定を開閉。
 - status: フィルタ（title / repo / author）で絞り込み。PR 行の id・タイトルがリンクになっており、クリックで GitHub へ遷移。ホバーするとレビュー履歴などの詳細が出ます。セルの背景色は状態（`waiting` / `should` / `finished`）を表します。`others` / `requested` 列は幅を制限し、全文はホバーで表示します。
 - stats: `days` を変更して `更新` を押すと集計期間が変わります。
-- 設定: `⚙ 設定` で (1) ユーザーごとの文字色（color picker）、(2) 一覧から除外する GitHub リンク（PR / リポジトリ URL）、(3) レビュー集計で無視するアカウント（bot 等。`finished` / `should` 判定や `others` に含めない）を設定できます。設定は `$HOME/.config/gh-review-insight/`（`colors.json` / `excludes.json` / `ignored.json`）に保存され、次回起動時に読み込まれます。
+- 設定: `⚙ 設定` で (1) ユーザーごとの文字色（color picker）、(2) 一覧から除外する GitHub リンク（取得済み PR をチェックボックスで複数選択して一括除外／除外中のリンクも複数選択で一括解除。PR / リポジトリ URL を改行・空白区切りで複数まとめて直接追加も可）、(3) レビュー集計で無視するアカウント（bot 等。`finished` / `should` 判定や `others` に含めない）を設定できます。設定は `$HOME/.config/gh-review-insight/`（`colors.json` / `excludes.json` / `ignored.json`）に保存され、次回起動時に読み込まれます。
 
 ## 構成
 

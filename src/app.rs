@@ -8,7 +8,7 @@
 //! Fetching runs on a background thread and the result is delivered over a
 //! channel, so the gh subprocess never blocks the UI thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -99,6 +99,10 @@ pub struct App {
     new_user: String,
     new_exclude: String,
     new_ignored: String,
+    /// PR URLs checked in the settings window, to be excluded in one go.
+    hide_selection: HashSet<String>,
+    /// Exclude entries checked in the settings window, to be removed in one go.
+    unhide_selection: HashSet<String>,
 }
 
 impl App {
@@ -122,6 +126,8 @@ impl App {
             new_user: String::new(),
             new_exclude: String::new(),
             new_ignored: String::new(),
+            hide_selection: HashSet::new(),
+            unhide_selection: HashSet::new(),
         }
     }
 
@@ -439,18 +445,34 @@ impl App {
         let snapshot = self.colors.clone();
         let excludes_snapshot = self.excludes.clone();
         let ignored_snapshot = self.ignored.clone();
+        // PRs in the current status list that aren't excluded yet: (url, label).
+        let hide_candidates: Vec<(String, String)> = match &self.state {
+            ViewState::Ready(Loaded::Status(prs)) => prs
+                .iter()
+                .filter(|pr| !self.is_excluded(&pr.url))
+                .map(|pr| (pr.url.clone(), format!("{}  {}", pr_short(pr), pr.title)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        // Drop selections that no longer point at anything listed.
+        self.hide_selection
+            .retain(|url| hide_candidates.iter().any(|(u, _)| u == url));
+        self.unhide_selection
+            .retain(|url| excludes_snapshot.iter().any(|e| e == url));
         let mut open = self.show_settings;
         // Collected outside the closures, then applied to `self` afterwards, so
         // we never borrow `self` across nested egui closures.
         let mut edits: Vec<(String, Option<[u8; 3]>)> = Vec::new();
         let mut add_user: Option<String> = None;
-        let mut add_exclude: Option<String> = None;
-        let mut remove_exclude: Option<String> = None;
+        let mut add_excludes: Vec<String> = Vec::new();
+        let mut remove_excludes: Vec<String> = Vec::new();
         let mut add_ignored: Option<String> = None;
         let mut remove_ignored: Option<String> = None;
         let new_user = &mut self.new_user;
         let new_exclude = &mut self.new_exclude;
         let new_ignored = &mut self.new_ignored;
+        let hide_selection = &mut self.hide_selection;
+        let unhide_selection = &mut self.unhide_selection;
 
         // Keep the window within the screen and scroll its whole body when the
         // lists (colors / excludes / ignored) grow tall.
@@ -496,22 +518,82 @@ impl App {
                 });
 
                 ui.separator();
-                ui.label("一覧から除外する GitHub リンク（PR またはリポジトリの URL）:");
-                for url in &excludes_snapshot {
+                ui.label("一覧から除外する PR（チェックして一括で除外）:");
+                if hide_candidates.is_empty() {
+                    ui.weak("（status 一覧の取得後に、除外していない PR が表示されます）");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("hide_candidates")
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for (url, label) in &hide_candidates {
+                                let mut checked = hide_selection.contains(url);
+                                if ui
+                                    .checkbox(&mut checked, label.as_str())
+                                    .on_hover_text(url.as_str())
+                                    .changed()
+                                {
+                                    toggle(hide_selection, url, checked);
+                                }
+                            }
+                        });
                     ui.horizontal(|ui| {
-                        if ui.button("解除").clicked() {
-                            remove_exclude = Some(url.clone());
+                        if ui.button("すべて選択").clicked() {
+                            hide_selection.extend(hide_candidates.iter().map(|(u, _)| u.clone()));
                         }
-                        ui.label(url);
+                        if ui.button("選択をクリア").clicked() {
+                            hide_selection.clear();
+                        }
+                        let label = format!("選択した {} 件を除外", hide_selection.len());
+                        if ui
+                            .add_enabled(!hide_selection.is_empty(), egui::Button::new(label))
+                            .clicked()
+                        {
+                            // Keep the on-screen order rather than the set's order.
+                            add_excludes.extend(
+                                hide_candidates
+                                    .iter()
+                                    .filter(|(u, _)| hide_selection.contains(u))
+                                    .map(|(u, _)| u.clone()),
+                            );
+                        }
                     });
                 }
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(new_exclude);
-                    if ui.button("除外に追加").clicked() {
-                        let trimmed = new_exclude.trim();
-                        if !trimmed.is_empty() {
-                            add_exclude = Some(trimmed.to_string());
+
+                ui.add_space(6.0);
+                ui.label("除外中の GitHub リンク（PR またはリポジトリの URL）:");
+                for url in &excludes_snapshot {
+                    let mut checked = unhide_selection.contains(url);
+                    if ui.checkbox(&mut checked, url.as_str()).changed() {
+                        toggle(unhide_selection, url, checked);
+                    }
+                }
+                if !excludes_snapshot.is_empty() {
+                    ui.horizontal(|ui| {
+                        if ui.button("すべて選択").clicked() {
+                            unhide_selection.extend(excludes_snapshot.iter().cloned());
                         }
+                        if ui.button("選択をクリア").clicked() {
+                            unhide_selection.clear();
+                        }
+                        let label = format!("選択した {} 件を解除", unhide_selection.len());
+                        if ui
+                            .add_enabled(!unhide_selection.is_empty(), egui::Button::new(label))
+                            .clicked()
+                        {
+                            remove_excludes.extend(unhide_selection.iter().cloned());
+                        }
+                    });
+                }
+                ui.label("URL を直接追加（改行・空白区切りで複数可）:");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(new_exclude)
+                            .desired_rows(2)
+                            .hint_text("https://github.com/owner/repo/pull/123"),
+                    );
+                    if ui.button("除外に追加").clicked() {
+                        add_excludes.extend(split_urls(new_exclude));
                     }
                 });
 
@@ -558,15 +640,19 @@ impl App {
         }
 
         let mut excludes_changed = false;
-        if let Some(url) = add_exclude {
-            if !self.excludes.iter().any(|e| e == &url) {
-                self.excludes.push(url);
+        if !add_excludes.is_empty() {
+            for url in add_excludes {
+                if !self.excludes.iter().any(|e| e == &url) {
+                    self.excludes.push(url);
+                }
             }
             self.new_exclude.clear();
+            self.hide_selection.clear();
             excludes_changed = true;
         }
-        if let Some(url) = remove_exclude {
-            self.excludes.retain(|e| e != &url);
+        if !remove_excludes.is_empty() {
+            self.excludes.retain(|e| !remove_excludes.contains(e));
+            self.unhide_selection.clear();
             excludes_changed = true;
         }
         if excludes_changed {
@@ -711,6 +797,24 @@ impl eframe::App for App {
     }
 }
 
+/// Add or remove `key` from a checkbox selection set.
+fn toggle(selection: &mut HashSet<String>, key: &str, checked: bool) {
+    if checked {
+        selection.insert(key.to_string());
+    } else {
+        selection.remove(key);
+    }
+}
+
+/// Split pasted text into exclude entries (newline / whitespace / comma separated).
+fn split_urls(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || c == ',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn date10(value: &str) -> String {
     value.chars().take(10).collect()
 }
@@ -827,6 +931,22 @@ mod tests {
         assert!(super::state_color("APPROVED", false).is_some());
         assert!(super::state_color("COMMENTED", true).is_none());
         assert!(super::state_color("CHANGES_REQUESTED", false).is_none());
+    }
+
+    #[test]
+    fn split_urls_accepts_multiple_separators() {
+        let urls = super::split_urls(
+            " https://github.com/o/r/pull/1\nhttps://github.com/o/r/pull/2, https://github.com/o/r2 \n\n",
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/o/r/pull/1",
+                "https://github.com/o/r/pull/2",
+                "https://github.com/o/r2",
+            ]
+        );
+        assert!(super::split_urls("  \n ").is_empty());
     }
 
     #[test]
