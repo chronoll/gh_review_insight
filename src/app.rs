@@ -5,7 +5,8 @@
 //!   opens the GitHub page in the browser. Rows can be checked and reviewed
 //!   in bulk by Claude Code: each selected PR gets an interactive `claude`
 //!   as a herdr tab, so the run is visible and continuable like normal
-//!   terminal usage.
+//!   terminal usage. The same selection can be hidden from the list in one
+//!   go (added to the excludes).
 //! - **stats**: aggregated review activity for the last N days.
 //!
 //! Fetching runs on a background thread and the result is delivered over a
@@ -147,6 +148,10 @@ pub struct App {
     new_user: String,
     new_exclude: String,
     new_ignored: String,
+    /// Exclude entries checked in the settings window, to be removed in one go.
+    unhide_selection: HashSet<String>,
+    /// Entries added by the last bulk hide, offered for undo in the toolbar.
+    last_hidden: Vec<String>,
     /// `claude` binary (resolved like `gh`; see claude.rs).
     claude_path: String,
     /// PR URLs checked for a batch AI review.
@@ -200,6 +205,8 @@ impl App {
             new_user: String::new(),
             new_exclude: String::new(),
             new_ignored: String::new(),
+            unhide_selection: HashSet::new(),
+            last_hidden: Vec::new(),
             claude_path: "claude".to_string(),
             selected: HashSet::new(),
             ai,
@@ -321,23 +328,50 @@ impl App {
         }
     }
 
-    /// Check every actionable (waiting / should) visible PR.
-    fn select_actionable(&mut self) {
+    /// True when the PR is shown in the status table (not excluded and
+    /// matching the filter).
+    fn is_visible(&self, pr: &PullRequestSummary) -> bool {
+        if self.is_excluded(&pr.url) {
+            return false;
+        }
+        let needle = self.filter.to_lowercase();
+        needle.is_empty()
+            || format!("{} {} {}", pr.title, pr.repository, pr.author)
+                .to_lowercase()
+                .contains(&needle)
+    }
+
+    /// Number of selected PRs an AI review would actually start for (rows
+    /// with a running tab stay selectable for hiding but are skipped here).
+    fn runnable_selected_count(&self) -> usize {
         let ViewState::Ready(Loaded::Status(prs)) = &self.state else {
-            return;
+            return 0;
         };
-        let urls: Vec<String> = prs
-            .iter()
-            .filter(|pr| !self.is_excluded(&pr.url))
-            .filter(|pr| {
-                matches!(
-                    pr.review_status(),
-                    ReviewStatus::RequestedUntouched | ReviewStatus::RequestedOthersReviewed
-                )
-            })
+        prs.iter()
+            .filter(|pr| self.selected.contains(&pr.url))
             .filter(|pr| !self.blocks_selection(pr))
-            .map(|pr| pr.url.clone())
-            .collect();
+            .count()
+    }
+
+    /// Hide every selected PR from the list by adding it to the excludes.
+    /// The added entries are kept so the toolbar can offer an undo.
+    fn hide_selected(&mut self) {
+        let mut urls: Vec<String> = self.selected.drain().collect();
+        urls.sort();
+        urls.retain(|url| !self.excludes.iter().any(|e| e == url));
+        if urls.is_empty() {
+            return;
+        }
+        self.excludes.extend(urls.iter().cloned());
+        self.save_excludes();
+        self.last_hidden = urls;
+    }
+
+    /// Undo the last bulk hide, restoring those PRs' selection too.
+    fn undo_hide(&mut self) {
+        let urls = std::mem::take(&mut self.last_hidden);
+        self.excludes.retain(|e| !urls.contains(e));
+        self.save_excludes();
         self.selected.extend(urls);
     }
 
@@ -549,26 +583,37 @@ impl App {
                             .desired_width(220.0),
                     );
                     ui.separator();
-                    if ui
-                        .button("未対応を選択")
-                        .on_hover_text("waiting / should の PR をまとめて選択（個別には行頭のチェックボックスで）")
-                        .clicked()
-                    {
-                        self.select_actionable();
-                    }
                     let count = self.selected.len();
+                    let runnable = self.runnable_selected_count();
                     if ui
                         .add_enabled(
-                            count > 0,
-                            egui::Button::new(format!("AIレビュー実行 ({count})")),
+                            runnable > 0,
+                            egui::Button::new(format!("AIレビュー実行 ({runnable})")),
                         )
-                        .on_hover_text("選択した PR ごとに herdr のタブとして claude を起動（実行の様子をターミナルで確認できます）")
+                        .on_hover_text("選択した PR ごとに herdr のタブとして claude を起動（実行の様子をターミナルで確認できます）。実行中のレビュータブがある PR は対象外")
                         .clicked()
                     {
                         self.start_ai_reviews(ctx);
                     }
-                    if count > 0 && ui.button("解除").clicked() {
+                    if ui
+                        .add_enabled(count > 0, egui::Button::new(format!("非表示 ({count})")))
+                        .on_hover_text("選択した PR を一覧から除外（⚙ 設定 から解除できます）")
+                        .clicked()
+                    {
+                        self.hide_selected();
+                    }
+                    if count > 0 && ui.button("選択解除").clicked() {
                         self.selected.clear();
+                    }
+                    if !self.last_hidden.is_empty() {
+                        ui.separator();
+                        ui.label(format!("{} 件を非表示にしました", self.last_hidden.len()));
+                        if ui.button("元に戻す").clicked() {
+                            self.undo_hide();
+                        }
+                        if ui.small_button("✕").clicked() {
+                            self.last_hidden.clear();
+                        }
                     }
                 }
                 Mode::Stats => {
@@ -598,17 +643,7 @@ impl App {
     }
 
     fn table(&self, ui: &mut egui::Ui, prs: &[PullRequestSummary], actions: &mut TableActions) {
-        let needle = self.filter.to_lowercase();
-        let rows: Vec<&PullRequestSummary> = prs
-            .iter()
-            .filter(|pr| !self.is_excluded(&pr.url))
-            .filter(|pr| {
-                needle.is_empty()
-                    || format!("{} {} {}", pr.title, pr.repository, pr.author)
-                        .to_lowercase()
-                        .contains(&needle)
-            })
-            .collect();
+        let rows: Vec<&PullRequestSummary> = prs.iter().filter(|pr| self.is_visible(pr)).collect();
 
         if rows.is_empty() {
             ui.label("表示できる PR がありません。");
@@ -647,13 +682,11 @@ impl App {
                     body.row(24.0, |mut row| {
                         row.col(|ui| {
                             fill_cell(ui, tint);
-                            let blocked = self.blocks_selection(pr);
-                            let mut checked = !blocked && self.selected.contains(&pr.url);
-                            let response =
-                                ui.add_enabled(!blocked, egui::Checkbox::without_text(&mut checked));
-                            let response = if blocked {
-                                response.on_disabled_hover_text(
-                                    "実行中のレビュータブがあるため選択できません",
+                            let mut checked = self.selected.contains(&pr.url);
+                            let response = ui.add(egui::Checkbox::without_text(&mut checked));
+                            let response = if self.blocks_selection(pr) {
+                                response.on_hover_text(
+                                    "実行中のレビュータブがあるため AIレビュー実行の対象外です（非表示にはできます）",
                                 )
                             } else if self.re_review_target(pr).is_some() {
                                 response.on_hover_text(
@@ -913,18 +946,22 @@ impl App {
         let snapshot = self.colors.clone();
         let excludes_snapshot = self.excludes.clone();
         let ignored_snapshot = self.ignored.clone();
+        // Drop selections that no longer point at an exclude entry.
+        self.unhide_selection
+            .retain(|url| excludes_snapshot.iter().any(|e| e == url));
         let mut open = self.show_settings;
         // Collected outside the closures, then applied to `self` afterwards, so
         // we never borrow `self` across nested egui closures.
         let mut edits: Vec<(String, Option<[u8; 3]>)> = Vec::new();
         let mut add_user: Option<String> = None;
-        let mut add_exclude: Option<String> = None;
-        let mut remove_exclude: Option<String> = None;
+        let mut add_excludes: Vec<String> = Vec::new();
+        let mut remove_excludes: Vec<String> = Vec::new();
         let mut add_ignored: Option<String> = None;
         let mut remove_ignored: Option<String> = None;
         let new_user = &mut self.new_user;
         let new_exclude = &mut self.new_exclude;
         let new_ignored = &mut self.new_ignored;
+        let unhide_selection = &mut self.unhide_selection;
 
         // Keep the window within the screen and scroll its whole body when the
         // lists (colors / excludes / ignored) grow tall.
@@ -972,20 +1009,37 @@ impl App {
                 ui.separator();
                 ui.label("一覧から除外する GitHub リンク（PR またはリポジトリの URL）:");
                 for url in &excludes_snapshot {
+                    let mut checked = unhide_selection.contains(url);
+                    if ui.checkbox(&mut checked, url.as_str()).changed() {
+                        toggle(unhide_selection, url, checked);
+                    }
+                }
+                if !excludes_snapshot.is_empty() {
                     ui.horizontal(|ui| {
-                        if ui.button("解除").clicked() {
-                            remove_exclude = Some(url.clone());
+                        if ui.button("すべて選択").clicked() {
+                            unhide_selection.extend(excludes_snapshot.iter().cloned());
                         }
-                        ui.label(url);
+                        if ui.button("選択をクリア").clicked() {
+                            unhide_selection.clear();
+                        }
+                        let label = format!("選択した {} 件を解除", unhide_selection.len());
+                        if ui
+                            .add_enabled(!unhide_selection.is_empty(), egui::Button::new(label))
+                            .clicked()
+                        {
+                            remove_excludes.extend(unhide_selection.iter().cloned());
+                        }
                     });
                 }
+                ui.label("URL を直接追加（改行・空白・カンマ区切りで複数可）:");
                 ui.horizontal(|ui| {
-                    ui.text_edit_singleline(new_exclude);
+                    ui.add(
+                        egui::TextEdit::multiline(new_exclude)
+                            .desired_rows(2)
+                            .hint_text("https://github.com/owner/repo/pull/123"),
+                    );
                     if ui.button("除外に追加").clicked() {
-                        let trimmed = new_exclude.trim();
-                        if !trimmed.is_empty() {
-                            add_exclude = Some(trimmed.to_string());
-                        }
+                        add_excludes.extend(split_urls(new_exclude));
                     }
                 });
 
@@ -1032,19 +1086,32 @@ impl App {
         }
 
         let mut excludes_changed = false;
-        if let Some(url) = add_exclude {
-            if !self.excludes.iter().any(|e| e == &url) {
-                self.excludes.push(url);
+        if !add_excludes.is_empty() {
+            for url in add_excludes {
+                if !self.excludes.iter().any(|e| e == &url) {
+                    self.excludes.push(url);
+                }
             }
             self.new_exclude.clear();
             excludes_changed = true;
         }
-        if let Some(url) = remove_exclude {
-            self.excludes.retain(|e| e != &url);
+        if !remove_excludes.is_empty() {
+            self.excludes.retain(|e| !remove_excludes.contains(e));
+            self.unhide_selection.clear();
             excludes_changed = true;
         }
         if excludes_changed {
             self.save_excludes();
+            // Hidden PRs shouldn't stay selected for a batch action.
+            let excluded: Vec<String> = self
+                .selected
+                .iter()
+                .filter(|url| self.is_excluded(url))
+                .cloned()
+                .collect();
+            for url in excluded {
+                self.selected.remove(&url);
+            }
         }
 
         let mut ignored_changed = false;
@@ -1207,6 +1274,24 @@ impl eframe::App for App {
     }
 }
 
+/// Add or remove `key` from a checkbox selection set.
+fn toggle(selection: &mut HashSet<String>, key: &str, checked: bool) {
+    if checked {
+        selection.insert(key.to_string());
+    } else {
+        selection.remove(key);
+    }
+}
+
+/// Split pasted text into exclude entries (newline / whitespace / comma separated).
+fn split_urls(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || c == ',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn date10(value: &str) -> String {
     value.chars().take(10).collect()
 }
@@ -1323,6 +1408,22 @@ mod tests {
         assert!(super::state_color("APPROVED", false).is_some());
         assert!(super::state_color("COMMENTED", true).is_none());
         assert!(super::state_color("CHANGES_REQUESTED", false).is_none());
+    }
+
+    #[test]
+    fn split_urls_accepts_multiple_separators() {
+        let urls = super::split_urls(
+            " https://github.com/o/r/pull/1\nhttps://github.com/o/r/pull/2, https://github.com/o/r2 \n\n",
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/o/r/pull/1",
+                "https://github.com/o/r/pull/2",
+                "https://github.com/o/r2",
+            ]
+        );
+        assert!(super::split_urls("  \n ").is_empty());
     }
 
     #[test]
