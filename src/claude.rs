@@ -73,7 +73,7 @@ const REVIEW_ALLOWED_TOOLS: &str = "Bash,Glob,Grep,Read,Agent,Task,TodoWrite,Ski
 /// Model and reasoning effort every `claude` invocation this app makes is
 /// pinned to, so review quality doesn't drift with whatever the user's own
 /// global default happens to be at the time.
-const REVIEW_MODEL: &str = "sonnet";
+const REVIEW_MODEL: &str = "opus";
 const REVIEW_EFFORT: &str = "xhigh";
 
 /// The prompt sent to `claude` for one PR: the PR URL そのもの。レビューは
