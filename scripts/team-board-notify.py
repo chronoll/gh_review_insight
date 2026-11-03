@@ -131,7 +131,10 @@ def main() -> int:
     notes = load_notes(args.notes_dir)
     snapshot = load_json(args.snapshot)
     prs = {p["key"]: p for p in snapshot.get("prs", [])}
-    names = {m["login"]: m.get("name") or m["login"] for m in load_json(args.config).get("members", [])}
+    config = load_json(args.config)
+    names = {m["login"]: m.get("name") or m["login"] for m in config.get("members", [])}
+    # Slack user ids from board/config to mention in the day's parent message.
+    mentions = [u for u in config.get("notifyMentions", []) if isinstance(u, str) and u.isalnum()]
     state = load_json(args.state)
     seen = state.get("seen", {})
 
@@ -148,8 +151,9 @@ def main() -> int:
     cutoff = (now - timedelta(days=KEEP_THREAD_DAYS)).strftime("%Y-%m-%d")
     threads = {d: ts for d, ts in state.get("threads", {}).items() if d >= cutoff}
 
+    mention = " ".join(f"<@{u}>" for u in mentions) + " " if mentions and mrkdwn else ""
     parent = (
-        bold(f"チームレビューボード：優先度・メモの更新（{now.month}/{now.day}）", mrkdwn) + "\n"
+        mention + bold(f"チームレビューボード：優先度・メモの更新（{now.month}/{now.day}）", mrkdwn) + "\n"
         f"今日の変更はこのスレッドに流れます。{link(args.board_url, 'ボードを開く', mrkdwn)}"
     )
     reply = (bold(f"{now:%H:%M} 時点の変更（{len(changes)}件）", mrkdwn) + "\n" + "\n".join(changes)) if changes else None
