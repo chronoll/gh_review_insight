@@ -18,7 +18,7 @@ message the first time, then the changes as a reply in its thread. The
 printed `notify.threads` then already holds the day's ts.
 
 Usage:
-    scripts/team-board-notify.py --notes-dir DIR --snapshot FILE \
+    scripts/team-board-notify.py (--notes-dir DIR | --notes-json FILE) --snapshot FILE \
         [--state FILE] --board-url URL [--post CHANNEL]
 """
 
@@ -45,14 +45,23 @@ def load_json(path: str | None) -> dict:
     return data.get("data", data) if isinstance(data, dict) else {}
 
 
-def load_notes(notes_dir: str) -> dict[str, dict]:
+def note_fields(doc: dict) -> dict:
+    return {"priority": doc.get("priority") or None, "note": (doc.get("note") or "").strip()}
+
+
+def load_notes(notes_dir: str | None, notes_json: str | None) -> dict[str, dict]:
+    """Notes from one JSON file — {id: doc} or [{"id", "data"}] — or from a
+    directory of `<owner>@<repo>@<number>.json` files."""
+    if notes_json:
+        raw = json.loads(Path(notes_json).read_text())
+        if isinstance(raw, dict):
+            items = raw.items()
+        else:
+            items = ((d["id"], d.get("data", d)) for d in raw)
+        return {key: note_fields(doc or {}) for key, doc in items}
     notes = {}
     for f in sorted(Path(notes_dir).glob("*.json")):
-        doc = load_json(str(f))
-        notes[f.stem.replace("@", "~")] = {
-            "priority": doc.get("priority") or None,
-            "note": (doc.get("note") or "").strip(),
-        }
+        notes[f.stem.replace("@", "~")] = note_fields(load_json(str(f)))
     return notes
 
 
@@ -117,7 +126,9 @@ def describe(key: str, old: dict | None, new: dict, prs: dict, names: dict, mrkd
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--notes-dir", required=True)
+    notes_src = ap.add_mutually_exclusive_group(required=True)
+    notes_src.add_argument("--notes-dir")
+    notes_src.add_argument("--notes-json", help='one file: {id: doc} or [{"id", "data"}]')
     ap.add_argument("--snapshot", required=True)
     ap.add_argument("--state", help="previous board/notify document (may be missing)")
     ap.add_argument("--config", help="board/config document, for member names")
@@ -128,7 +139,7 @@ def main() -> int:
 
     now = datetime.now(JST)
     today = now.strftime("%Y-%m-%d")
-    notes = load_notes(args.notes_dir)
+    notes = load_notes(args.notes_dir, args.notes_json)
     snapshot = load_json(args.snapshot)
     prs = {p["key"]: p for p in snapshot.get("prs", [])}
     config = load_json(args.config)

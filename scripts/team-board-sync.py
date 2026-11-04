@@ -106,7 +106,16 @@ def main() -> int:
 
     ignored = set(args.ignore)
     members = set(args.member)
-    targets = [(repo, p["number"]) for repo in args.repo for p in open_prs_by(repo, members)]
+    # A repository this session cannot read is skipped and reported, so one
+    # missing repository does not stop the whole board from updating.
+    targets, readable, skipped = [], [], []
+    for repo in args.repo:
+        try:
+            targets += [(repo, p["number"]) for p in open_prs_by(repo, members)]
+            readable.append(repo)
+        except subprocess.CalledProcessError as e:
+            skipped.append(repo)
+            print(f"skipped {repo}: {(e.stderr or '').strip()[:200]}", file=sys.stderr)
     with ThreadPoolExecutor(max_workers=6) as pool:
         prs = list(pool.map(lambda t: collect(t[0], t[1], ignored), targets))
     prs.sort(key=lambda p: p["updatedAt"], reverse=True)
@@ -115,7 +124,8 @@ def main() -> int:
         {
             "syncedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "members": args.member,
-            "repos": args.repo,
+            "repos": readable,
+            "skipped": skipped,
             "prs": prs,
         },
         sys.stdout,
